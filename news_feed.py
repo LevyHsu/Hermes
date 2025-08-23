@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+news_feed.py — Continuous, minute-bucketed RSS → JSONL harvester.
+
+Changes per spec:
+• Only save items whose PUBLISHED time falls within the CURRENT LOCAL MINUTE.
+• Default 4 threads (ThreadPoolExecutor).
+• Use a common Chrome User-Agent for HTTP requests.
+• 20s time budget per minute (configurable).
+• Never stops unless a signal is caught.
+
+Output (local time):
+  ./data/news/YYMMDDHHMM/items.jsonl   # JSON Lines; one record per line
+
+Item schema (per line):
+{
+  "id": "<sha256(link|published_iso)>",
+  "title": "...",
+  "link": "https://...",
+  "published_at_local": "YYYY-MM-DDTHH:MM:SS±HH:MM",
+  "published_at_utc": "YYYY-MM-DDTHH:MM:SSZ",
+  "fetched_at_utc": "YYYY-MM-DDTHH:MM:SSZ",
+  "source_title": "...",
+  "source_domain": "example.com",
+  "rss_url": "https://...rss",
+  "authors": ["..."],
+  "categories": ["..."],
+  "summary": "...",           # if provided
+  "content_html": "<p>...</p>"# if provided
+}
+
+Completeness rule (must have): title, link, and a parseable published/updated time.
+"""
+
+import argparse
+import calendar
+import hashlib
+import json
+import os
+import signal
+import sys
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+import feedparser   # pip install feedparser
+import requests     # pip install requests
+
+# ---------- Reliable default feeds (official) ----------
+# (Verified official pages below in citations)
+DEFAULT_FEEDS = [
+    # Bloomberg
+    "https://feeds.bloomberg.com/markets/news.rss",
+    "https://feeds.bloomberg.com/economics/news.rss",
+
+    # MarketWatch (Dow Jones)
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "https://feeds.content.dowjones.io/public/rss/mw_bulletins",
+
+    # Wall Street Journal (directory provides many sections; this one is common)
+    "https://feeds.wsjonline.com/wsj/economics/feed",
+
+    # Financial Times (sitewide)
+    "https://www.ft.com/news-feed?format=rss",
+
+    # Washington Post – Business
+    "https://feeds.washingtonpost.com/rss/business/",
+
+    # NPR – Business
+    "https://feeds.npr.org/1006/rss.xml",
+
+    # SEC – Latest EDGAR filings (Atom)
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&output=atom",
+
+    # Federal Reserve – All press releases
+    "https://www.federalreserve.gov/feeds/press_all.xml",
+
+    # Tech (useful for market-moving tech headlines)
+    "https://techcrunch.com/feed/",
+    "https://www.theverge.com/rss/quickposts",  # public “quick posts” feed
+    # Finance aggregators
+    "https://finance.yahoo.com/news/rss",
+    "https://www.investing.com/rss/news.rss",
+    "https://feeds.bloomberg.com/technology/news.rss",
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",            # WSJ Markets
+    "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",          # WSJ U.S. Business
+    "https://feeds.a.dj.com/rss/RSSEconomy.xml",                # WSJ Economy
+    "https://www.ft.com/markets?format=rss",                    # FT Markets
+    "https://www.ft.com/companies?format=rss",                  # FT Companies
+    "https://www.ft.com/global-economy?format=rss",             # FT Global Economy
+    "https://www.ft.com/technology?format=rss",                 # FT Technology
+    "https://www.ft.com/world/us?format=rss",                   # FT U.S.
+    "http://feeds.bbci.co.uk/news/business/rss.xml",            # BBC Business
+    "https://www.theguardian.com/business/rss",                 # Guardian Business
+    "https://www.theguardian.com/business/economics/rss",       # Guardian Economics
+    "https://www.theguardian.com/us-news/rss",                  # Guardian U.S. news
+    "https://www.marketwatch.com/feeds/topstories",             # MarketWatch Top
+    "https://feeds.marketwatch.com/marketwatch/marketpulse/",   # MarketWatch MarketPulse
+    "https://www.investors.com/feed/",                          # Investor’s Business Daily
+    "https://www.barrons.com/magazine/rss",                     # Barron's (magazine)
+
+    # --- Tech (often market-moving) ---
+    "https://www.theverge.com/rss/index.xml",
+    "https://feeds.arstechnica.com/arstechnica/index",
+    "https://www.wired.com/feed/rss",
+
+    # --- U.S. regulators / government (market-moving) ---
+    "https://www.federalreserve.gov/feeds/press_monetary.xml",  # Fed – monetary policy
+    "https://apps.bea.gov/rss/rss.xml",                         # BEA news releases
+    "https://www.sec.gov/news/pressreleases.rss",               # SEC press releases
+    "https://www.cftc.gov/RSS/RSSGP/rssgp.xml",                 # CFTC press
+    "https://www.cftc.gov/RSS/RSSENF/rssenf.xml",               # CFTC enforcement
+    "https://www.cftc.gov/RSS/RSSST/rssst.xml",                 # CFTC speeches/testimony
+
+    # --- Corporate press wires (official releases; high volume) ---
+    "https://www.prnewswire.com/rss/news-releases-list.rss",    # PR Newswire (all releases)
+    "https://rss.globenewswire.com/rssfeed/",                   # GlobeNewswire (general feed)
+]
+
+# Common (modern) Chrome UA; adjust if you prefer.
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/127.0.0.0 Safari/537.36"
+)
+
+STOP = False
+
+
+def handle_signal(signum, frame):
+    global STOP
+    STOP = True
+    print(f"[signal] Caught {signum}. Shutting down gracefully...", file=sys.stderr)
+
+
+for _sig in (signal.SIGINT, signal.SIGTERM):
+    try:
+        signal.signal(_sig, handle_signal)
+    except Exception:
+        pass
+
+
+def log(msg: str, verbose: bool):
+    if verbose:
+        now = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now}] {msg}", file=sys.stderr)
+
+
+def safe_get(url: str, timeout: float = 10.0) -> Optional[bytes]:
+    try:
+        resp = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception:
+        pass
+    return None
+
+
+def struct_time_to_aware_utc(st) -> Optional[datetime]:
+    if not st:
+        return None
+    try:
+        ts = calendar.timegm(st)  # treat struct_time as UTC
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        return None
+
+
+def get_best_published(entry: dict) -> Optional[datetime]:
+    dt = struct_time_to_aware_utc(entry.get("published_parsed"))
+    if dt:
+        return dt
+    return struct_time_to_aware_utc(entry.get("updated_parsed"))
+
+
+def entry_to_record(entry: dict, feed_url: str, feed_title: Optional[str]) -> Optional[Dict[str, Any]]:
+    title = (entry.get("title") or "").strip()
+    link = (entry.get("link") or "").strip()
+
+    published_utc = get_best_published(entry)
+    if not (title and link and published_utc):
+        return None  # incomplete → drop
+
+    published_local = published_utc.astimezone()  # system local tz
+
+    authors = []
+    if entry.get("authors"):
+        for a in entry["authors"]:
+            name = a.get("name") or a.get("email") or ""
+            if name:
+                authors.append(name)
+
+    categories = []
+    if entry.get("tags"):
+        for t in entry["tags"]:
+            term = t.get("term")
+            if term:
+                categories.append(term)
+
+    summary = entry.get("summary")
+    content_html = None
+    if entry.get("content"):
+        try:
+            content_html = entry["content"][0].get("value")
+        except Exception:
+            content_html = None
+
+    try:
+        src_domain = urlparse(link).netloc
+    except Exception:
+        src_domain = ""
+
+    rec_id = hashlib.sha256(f"{link}|{published_utc.isoformat()}".encode("utf-8")).hexdigest()
+
+    return {
+        "id": rec_id,
+        "title": title,
+        "link": link,
+        "published_at_local": published_local.isoformat(timespec="seconds"),
+        "published_at_utc": published_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "fetched_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "source_title": (feed_title or src_domain or None),
+        "source_domain": src_domain or None,
+        "rss_url": feed_url,
+        "authors": authors or None,
+        "categories": categories or None,
+        "summary": summary or None,
+        "content_html": content_html or None,
+    }
+
+
+def fetch_and_parse(feed_url: str, request_timeout: float = 10.0) -> List[Dict[str, Any]]:
+    data = safe_get(feed_url, timeout=request_timeout)
+    if not data:
+        return []
+    parsed = feedparser.parse(data)
+    feed_title = (parsed.get("feed") or {}).get("title")
+    out: List[Dict[str, Any]] = []
+    for e in parsed.get("entries", []):
+        rec = entry_to_record(e, feed_url, feed_title)
+        if rec:
+            out.append(rec)
+    return out
+
+
+def minute_bounds(dt_local: datetime):
+    start = dt_local.replace(second=0, microsecond=0)
+    end = start + timedelta(minutes=1)
+    return start, end
+
+
+def is_in_minute(rec: Dict[str, Any], minute_start: datetime, minute_end: datetime) -> bool:
+    try:
+        dt_local = datetime.fromisoformat(rec["published_at_local"])
+        return minute_start <= dt_local < minute_end
+    except Exception:
+        return False
+
+
+def minute_key(dt_local: datetime) -> str:
+    # YYMMDDHHMM in local time
+    return dt_local.strftime("%y%m%d%H%M")
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def append_jsonl(path: str, records: List[Dict[str, Any]]):
+    with open(path, "a", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def load_extra_feeds(path: str, verbose: bool) -> List[str]:
+    feeds: List[str] = []
+    if not path:
+        return feeds
+    try:
+        if path.lower().endswith(".json"):
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+                if isinstance(obj, list):
+                    feeds = [str(x).strip() for x in obj if str(x).strip()]
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        feeds.append(s)
+    except Exception as e:
+        print(f"[warn] Failed to load feeds file {path}: {e}", file=sys.stderr)
+    if verbose and feeds:
+        log(f"Loaded {len(feeds)} extra feeds from {path}", True)
+    return feeds
+
+
+def sleep_until_next_minute():
+    now = datetime.now()
+    secs = 60 - now.second - (1 if now.microsecond > 0 else 0)
+    if secs > 0:
+        time.sleep(secs)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Continuous RSS harvester (minute-bucketed JSONL, current minute only).")
+    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker threads (default: )")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--feeds-file", type=str, default=None, help="Path to extra feeds file (json or newline list)")
+    parser.add_argument("--out-dir", type=str, default="./data/news", help="Output base directory (default: ./data/news)")
+    parser.add_argument("--request-timeout", type=float, default=10.0, help="Per-request timeout in seconds (default: 10)")
+    parser.add_argument("--cycle-budget", type=float, default=15.0, help="Time budget (s) per minute cycle (default: 15)")
+    args = parser.parse_args()
+
+    feeds = list(dict.fromkeys(DEFAULT_FEEDS + load_extra_feeds(args.feeds_file, args.verbose)))  # de-dup preserve order
+    if not feeds:
+        print("No feeds to process.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.verbose:
+        log(f"Starting with {len(feeds)} feeds, {args.threads} threads, {args.cycle_budget:.0f}s budget per minute.", True)
+
+    # Main loop: never stop unless signaled
+    while not STOP:
+        cycle_start_local = datetime.now()
+        minute_start, minute_end = minute_bounds(cycle_start_local)
+        bucket_name = minute_key(minute_start)
+        if args.verbose:
+            log(f"Minute bucket {bucket_name} (local) — collecting up to {args.cycle_budget:.0f}s…", True)
+
+        deadline = cycle_start_local + timedelta(seconds=args.cycle_budget)
+        records_for_minute: List[Dict[str, Any]] = []
+        seen_links = set()
+
+        try:
+            with ThreadPoolExecutor(max_workers=args.threads) as ex:
+                futures = {ex.submit(fetch_and_parse, url, args.request_timeout): url for url in feeds}
+
+                while futures and datetime.now() < deadline and not STOP:
+                    time_left = (deadline - datetime.now()).total_seconds()
+                    if time_left <= 0:
+                        break
+                    done, _pending = wait(list(futures.keys()), timeout=time_left, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        url = futures.pop(fut, None)
+                        try:
+                            results = fut.result() or []
+                            # Filter STRICTLY to current local minute window
+                            for r in results:
+                                if not is_in_minute(r, minute_start, minute_end):
+                                    continue
+                                lk = r.get("link")
+                                if lk and lk not in seen_links:
+                                    seen_links.add(lk)
+                                    records_for_minute.append(r)
+                        except Exception:
+                            pass
+                # Executor exits here; remaining futures will be cleaned up.
+        except Exception:
+            pass
+
+        # Write ONLY current minute’s items
+        if records_for_minute:
+            out_dir = os.path.join(args.out_dir, bucket_name)
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, "items.jsonl")
+            append_jsonl(out_path, records_for_minute)
+
+        if args.verbose:
+            took = (datetime.now() - cycle_start_local).total_seconds()
+            log(f"Saved {len(records_for_minute)} item(s) to {bucket_name}/items.jsonl in {took:.2f}s.", True)
+
+        if STOP:
+            break
+        sleep_until_next_minute()
+
+    if args.verbose:
+        log("Stopped.", True)
+
+
+if __name__ == "__main__":
+    try:
+        import multiprocessing as _mp  # noqa
+        _mp.freeze_support()
+    except Exception:
+        pass
+    main()
