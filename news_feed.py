@@ -12,7 +12,7 @@ Changes per spec:
 • Never stops unless a signal is caught.
 
 Output (local time):
-  ./data/news/YYMMDDHHMM/items.jsonl   # JSON Lines; one record per line
+  ./data/news/YYMMDDHHMM.json          # JSON array per minute
 
 Item schema (per line):
 {
@@ -302,19 +302,20 @@ def load_extra_feeds(path: str, verbose: bool) -> List[str]:
 
 def sleep_until_next_minute():
     now = datetime.now()
-    secs = 60 - now.second - (1 if now.microsecond > 0 else 0)
+    next_min = (now.replace(second=0, microsecond=0) + timedelta(minutes=1))
+    secs = (next_min - now).total_seconds()
     if secs > 0:
         time.sleep(secs)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Continuous RSS harvester (minute-bucketed JSONL, current minute only).")
-    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker threads (default: )")
+    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker threads (default: 4)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--feeds-file", type=str, default=None, help="Path to extra feeds file (json or newline list)")
     parser.add_argument("--out-dir", type=str, default="./data/news", help="Output base directory (default: ./data/news)")
     parser.add_argument("--request-timeout", type=float, default=10.0, help="Per-request timeout in seconds (default: 10)")
-    parser.add_argument("--cycle-budget", type=float, default=15.0, help="Time budget (s) per minute cycle (default: 15)")
+    parser.add_argument("--cycle-budget", type=float, default=20.0, help="Time budget (s) per minute cycle (default: 20)")
     args = parser.parse_args()
 
     feeds = list(dict.fromkeys(DEFAULT_FEEDS + load_extra_feeds(args.feeds_file, args.verbose)))  # de-dup preserve order
@@ -322,16 +323,24 @@ def main():
         print("No feeds to process.", file=sys.stderr)
         sys.exit(1)
 
+    # Always skip the current (partial) minute, start at the next boundary
+    if args.verbose:
+        log("Aligning to next minute boundary; current minute will be skipped.", True)
+    sleep_until_next_minute()
+
     if args.verbose:
         log(f"Starting with {len(feeds)} feeds, {args.threads} threads, {args.cycle_budget:.0f}s budget per minute.", True)
 
     # Main loop: never stop unless signaled
     while not STOP:
         cycle_start_local = datetime.now()
-        minute_start, minute_end = minute_bounds(cycle_start_local)
+        # Process the PREVIOUS local minute to avoid double-catching the current minute
+        now_floor = cycle_start_local.replace(second=0, microsecond=0)
+        minute_start = now_floor - timedelta(minutes=1)
+        minute_end = now_floor
         bucket_name = minute_key(minute_start)
         if args.verbose:
-            log(f"Minute bucket {bucket_name} (local) — collecting up to {args.cycle_budget:.0f}s…", True)
+            log(f"Processing previous minute bucket {bucket_name} (local) — budget {args.cycle_budget:.0f}s…", True)
 
         deadline = cycle_start_local + timedelta(seconds=args.cycle_budget)
         records_for_minute: List[Dict[str, Any]] = []
@@ -364,16 +373,19 @@ def main():
         except Exception:
             pass
 
-        # Write ONLY current minute’s items
+        # Write ONLY previous minute’s items as a single JSON array file:
+        # ./data/news/YYMMDDHHMM.json
         if records_for_minute:
-            out_dir = os.path.join(args.out_dir, bucket_name)
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, "items.jsonl")
-            append_jsonl(out_path, records_for_minute)
+            os.makedirs(args.out_dir, exist_ok=True)
+            out_path = os.path.join(args.out_dir, f"{bucket_name}.json")
+            tmp_path = out_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(records_for_minute, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, out_path)
 
         if args.verbose:
             took = (datetime.now() - cycle_start_local).total_seconds()
-            log(f"Saved {len(records_for_minute)} item(s) to {bucket_name}/items.jsonl in {took:.2f}s.", True)
+            log(f"Saved {len(records_for_minute)} item(s) to {bucket_name}.json in {took:.2f}s.", True)
 
         if STOP:
             break
