@@ -5,7 +5,8 @@
 news_feed.py — Continuous, minute-bucketed RSS → JSONL harvester.
 
 Changes per spec:
-• Only save items whose PUBLISHED time falls within the CURRENT LOCAL MINUTE.
+• First minutes after start: grab any items we've never seen before (first-seen).
+• Thereafter: every minute, save any new (first-seen) items into the previous-minute bucket.
 • Default 4 threads (ThreadPoolExecutor).
 • Use a common Chrome User-Agent for HTTP requests.
 • 20s time budget per minute (configurable).
@@ -16,22 +17,25 @@ Output (local time):
 
 Item schema (per line):
 {
-  "id": "<sha256(link|published_iso)>",
+  "id": "<stable hash from guid/id/link/title>",
   "title": "...",
   "link": "https://...",
-  "published_at_local": "YYYY-MM-DDTHH:MM:SS±HH:MM",
-  "published_at_utc": "YYYY-MM-DDTHH:MM:SSZ",
+  "published_at_local": "YYYY-MM-DDTHH:MM:SS±HH:MM" or null,
+  "published_at_utc": "YYYY-MM-DDTHH:MM:SSZ" or null,
   "fetched_at_utc": "YYYY-MM-DDTHH:MM:SSZ",
+  "first_seen_local": "YYYY-MM-DDTHH:MM:SS±HH:MM",
+  "first_seen_utc": "YYYY-MM-DDTHH:MM:SSZ",
   "source_title": "...",
   "source_domain": "example.com",
   "rss_url": "https://...rss",
   "authors": ["..."],
   "categories": ["..."],
-  "summary": "...",           # if provided
-  "content_html": "<p>...</p>"# if provided
+  "summary": "...",
+  "content_html": "<p>...</p>",
+  "guid": "..."   # when provided by the feed
 }
 
-Completeness rule (must have): title, link, and a parseable published/updated time.
+Completeness rule (must have): title and link.
 """
 
 import argparse
@@ -50,6 +54,8 @@ from urllib.parse import urlparse
 
 import feedparser   # pip install feedparser
 import requests     # pip install requests
+from pathlib import Path
+import sqlite3
 
 # ---------- Reliable default feeds (official) ----------
 # (Verified official pages below in citations)
@@ -131,6 +137,20 @@ UA = (
 
 STOP = False
 
+SEEN_DB_PATH = Path("./data/news/.seen.db")
+
+def seen_db_init():
+    SEEN_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(SEEN_DB_PATH)
+    con.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, first_seen_utc TEXT NOT NULL)")
+    con.commit()
+    return con
+def compute_entry_id(entry: dict) -> str:
+    src = entry.get("id") or entry.get("guid") or entry.get("link") or (entry.get("title") or "")
+    if isinstance(src, dict):  # some feeds nest guid as {"#text": "..."}
+        src = src.get("#text") or json.dumps(src, sort_keys=True)
+    return hashlib.sha256(str(src).encode("utf-8")).hexdigest()
+
 
 def handle_signal(signum, frame):
     global STOP
@@ -183,10 +203,10 @@ def entry_to_record(entry: dict, feed_url: str, feed_title: Optional[str]) -> Op
     link = (entry.get("link") or "").strip()
 
     published_utc = get_best_published(entry)
-    if not (title and link and published_utc):
+    if not (title and link):
         return None  # incomplete → drop
 
-    published_local = published_utc.astimezone()  # system local tz
+    published_local = published_utc.astimezone() if published_utc else None
 
     authors = []
     if entry.get("authors"):
@@ -215,15 +235,17 @@ def entry_to_record(entry: dict, feed_url: str, feed_title: Optional[str]) -> Op
     except Exception:
         src_domain = ""
 
-    rec_id = hashlib.sha256(f"{link}|{published_utc.isoformat()}".encode("utf-8")).hexdigest()
+    rec_id = compute_entry_id(entry)
 
     return {
         "id": rec_id,
         "title": title,
         "link": link,
-        "published_at_local": published_local.isoformat(timespec="seconds"),
-        "published_at_utc": published_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "published_at_local": published_local.isoformat(timespec="seconds") if published_local else None,
+        "published_at_utc": published_utc.isoformat(timespec="seconds").replace("+00:00", "Z") if published_utc else None,
         "fetched_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "first_seen_local": None,
+        "first_seen_utc": None,
         "source_title": (feed_title or src_domain or None),
         "source_domain": src_domain or None,
         "rss_url": feed_url,
@@ -231,6 +253,7 @@ def entry_to_record(entry: dict, feed_url: str, feed_title: Optional[str]) -> Op
         "categories": categories or None,
         "summary": summary or None,
         "content_html": content_html or None,
+        "guid": entry.get("id") or entry.get("guid"),
     }
 
 
@@ -254,12 +277,6 @@ def minute_bounds(dt_local: datetime):
     return start, end
 
 
-def is_in_minute(rec: Dict[str, Any], minute_start: datetime, minute_end: datetime) -> bool:
-    try:
-        dt_local = datetime.fromisoformat(rec["published_at_local"])
-        return minute_start <= dt_local < minute_end
-    except Exception:
-        return False
 
 
 def minute_key(dt_local: datetime) -> str:
@@ -308,6 +325,78 @@ def sleep_until_next_minute():
         time.sleep(secs)
 
 
+# --- Backfill logic: collect history during first 1-2 minutes, update seen DB only ---
+def backfill_history(feeds: List[str], threads: int, request_timeout: float, deadline: datetime,
+                     con: sqlite3.Connection, inmem_seen: set, verbose: bool):
+    """Continuously scan feeds and mark items as seen until either:
+    - we complete at least one full pass with 0 new items (early complete), or
+    - we hit the provided deadline (end of the second minute).
+    No files are written during backfill. Only the seen DB is updated.
+    """
+    pass_count = 0
+    while (not STOP) and (datetime.now() < deadline):
+        pass_count += 1
+        new_pairs = []  # [(id, first_seen_utc)] to persist
+        try:
+            with ThreadPoolExecutor(max_workers=threads) as ex:
+                futures = {ex.submit(fetch_and_parse, url, request_timeout): url for url in feeds}
+                while futures and (datetime.now() < deadline) and (not STOP):
+                    time_left = (deadline - datetime.now()).total_seconds()
+                    if time_left <= 0:
+                        break
+                    # bound the wait by the smaller of remaining time or request timeout
+                    wait_timeout = min(request_timeout, max(0.0, time_left))
+                    done, _pending = wait(list(futures.keys()), timeout=wait_timeout, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        _url = futures.pop(fut, None)
+                        try:
+                            results = fut.result() or []
+                            for r in results:
+                                rec_id = r.get("id") or compute_entry_id({
+                                    "id": None,
+                                    "guid": None,
+                                    "link": r.get("link"),
+                                    "title": r.get("title"),
+                                })
+                                r["id"] = rec_id
+                                if rec_id in inmem_seen:
+                                    continue
+                                cur = con.execute("SELECT 1 FROM seen WHERE id=?", (rec_id,))
+                                if cur.fetchone():
+                                    continue
+                                now_utc = datetime.now(timezone.utc)
+                                # stamp first-seen timestamps (not used for files in backfill)
+                                r["first_seen_utc"] = now_utc.isoformat(timespec="seconds").replace("+00:00", "Z")
+                                r["first_seen_local"] = now_utc.astimezone().isoformat(timespec="seconds")
+                                inmem_seen.add(rec_id)
+                                new_pairs.append((rec_id, r["first_seen_utc"]))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        if new_pairs:
+            try:
+                with con:
+                    con.executemany(
+                        "INSERT OR IGNORE INTO seen(id, first_seen_utc) VALUES(?, ?)",
+                        new_pairs,
+                    )
+            except Exception:
+                pass
+
+        if verbose:
+            now_str = datetime.now().strftime("%H:%M:%S")
+            dl_str = deadline.strftime("%H:%M:%S")
+            log(f"Backfill pass {pass_count}: newly seen {len(new_pairs)} items (now {now_str}, deadline {dl_str}).", True)
+
+        # Early completion heuristic: one full pass with zero new items
+        if len(new_pairs) == 0 and pass_count >= 1:
+            if verbose:
+                log("Backfill appears complete early; switching to minute mode.", True)
+            break
+
+
 def main():
     parser = argparse.ArgumentParser(description="Continuous RSS harvester (minute-bucketed JSONL, current minute only).")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker threads (default: 4)")
@@ -323,15 +412,31 @@ def main():
         print("No feeds to process.", file=sys.stderr)
         sys.exit(1)
 
-    # Always skip the current (partial) minute, start at the next boundary
-    if args.verbose:
-        log("Aligning to next minute boundary; current minute will be skipped.", True)
-    sleep_until_next_minute()
-
     if args.verbose:
         log(f"Starting with {len(feeds)} feeds, {args.threads} threads, {args.cycle_budget:.0f}s budget per minute.", True)
 
-    # Main loop: never stop unless signaled
+    # Initialize seen-store and in-memory cache
+    con = seen_db_init()
+    inmem_seen = set()
+
+    # Bootstrap/backfill phase: first minute collects history, second minute continues if needed.
+    start_ts = datetime.now()
+    current_floor = start_ts.replace(second=0, microsecond=0)
+    first_minute_end = current_floor + timedelta(minutes=1)
+    second_minute_end = current_floor + timedelta(minutes=2)
+    if args.verbose:
+        log(f"Backfill starting; allowed until end of second minute ({second_minute_end.strftime('%H:%M:%S')}).", True)
+    backfill_history(
+        feeds=feeds,
+        threads=args.threads,
+        request_timeout=args.request_timeout,
+        deadline=second_minute_end,
+        con=con,
+        inmem_seen=inmem_seen,
+        verbose=args.verbose,
+    )
+
+    # Main loop: minute-by-minute mode
     while not STOP:
         cycle_start_local = datetime.now()
         # Process the PREVIOUS local minute to avoid double-catching the current minute
@@ -340,11 +445,11 @@ def main():
         minute_end = now_floor
         bucket_name = minute_key(minute_start)
         if args.verbose:
-            log(f"Processing previous minute bucket {bucket_name} (local) — budget {args.cycle_budget:.0f}s…", True)
+            log(f"[minute-mode] Processing previous minute bucket {bucket_name} (local) — budget {args.cycle_budget:.0f}s…", True)
 
         deadline = cycle_start_local + timedelta(seconds=args.cycle_budget)
         records_for_minute: List[Dict[str, Any]] = []
-        seen_links = set()
+        fetched_items = 0
 
         try:
             with ThreadPoolExecutor(max_workers=args.threads) as ex:
@@ -359,14 +464,20 @@ def main():
                         url = futures.pop(fut, None)
                         try:
                             results = fut.result() or []
-                            # Filter STRICTLY to current local minute window
+                            fetched_items += len(results)
                             for r in results:
-                                if not is_in_minute(r, minute_start, minute_end):
+                                rec_id = r.get("id") or compute_entry_id({"id": None, "guid": None, "link": r.get("link"), "title": r.get("title")})
+                                r["id"] = rec_id
+                                if rec_id in inmem_seen:
                                     continue
-                                lk = r.get("link")
-                                if lk and lk not in seen_links:
-                                    seen_links.add(lk)
-                                    records_for_minute.append(r)
+                                cur = con.execute("SELECT 1 FROM seen WHERE id=?", (rec_id,))
+                                if cur.fetchone():
+                                    continue
+                                now_utc = datetime.now(timezone.utc)
+                                r["first_seen_utc"] = now_utc.isoformat(timespec="seconds").replace("+00:00", "Z")
+                                r["first_seen_local"] = now_utc.astimezone().isoformat(timespec="seconds")
+                                inmem_seen.add(rec_id)
+                                records_for_minute.append(r)
                         except Exception:
                             pass
                 # Executor exits here; remaining futures will be cleaned up.
@@ -382,10 +493,16 @@ def main():
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(records_for_minute, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, out_path)
+        if records_for_minute:
+            with con:
+                con.executemany(
+                    "INSERT OR IGNORE INTO seen(id, first_seen_utc) VALUES (?, ?)",
+                    [(r["id"], r["first_seen_utc"]) for r in records_for_minute]
+                )
 
         if args.verbose:
             took = (datetime.now() - cycle_start_local).total_seconds()
-            log(f"Saved {len(records_for_minute)} item(s) to {bucket_name}.json in {took:.2f}s.", True)
+            log(f"Fetched ~{fetched_items} items; saved {len(records_for_minute)} to {bucket_name}.json in {took:.2f}s.", True)
 
         if STOP:
             break
