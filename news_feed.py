@@ -7,6 +7,7 @@ news_feed.py — Continuous, minute-bucketed RSS → JSONL harvester.
 Changes per spec:
 • First minutes after start: grab any items we've never seen before (first-seen).
 • Thereafter: every minute, save any new (first-seen) items into the previous-minute bucket.
+• Records must include main article text ("article-body"); items without it are dropped.
 • Default 4 threads (ThreadPoolExecutor).
 • Use a common Chrome User-Agent for HTTP requests.
 • 20s time budget per minute (configurable).
@@ -32,10 +33,11 @@ Item schema (per line):
   "categories": ["..."],
   "summary": "...",
   "content_html": "<p>...</p>",
+  "article-body": "...",
   "guid": "..."   # when provided by the feed
 }
 
-Completeness rule (must have): title and link.
+Completeness rule (must have): title, link, and article-body.
 """
 
 import argparse
@@ -56,6 +58,8 @@ import feedparser   # pip install feedparser
 import requests     # pip install requests
 from pathlib import Path
 import sqlite3
+from readability import Document  # pip install readability-lxml
+from bs4 import BeautifulSoup     # pip install beautifulsoup4
 
 # ---------- Reliable default feeds (official) ----------
 # (Verified official pages below in citations)
@@ -253,6 +257,7 @@ def entry_to_record(entry: dict, feed_url: str, feed_title: Optional[str]) -> Op
         "categories": categories or None,
         "summary": summary or None,
         "content_html": content_html or None,
+        "article-body": None,
         "guid": entry.get("id") or entry.get("guid"),
     }
 
@@ -292,6 +297,97 @@ def append_jsonl(path: str, records: List[Dict[str, Any]]):
     with open(path, "a", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+# --- Article body extraction helpers ---
+def html_to_text(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+        return " ".join(soup.get_text(" ", strip=True).split())
+    except Exception:
+        return ""
+
+def fetch_article_html(url: str, timeout: float = 10.0) -> Optional[str]:
+    try:
+        resp = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        text = resp.text if ("html" in ctype or ctype == "") else resp.text
+        if not text:
+            try:
+                text = resp.content.decode(resp.encoding or "utf-8", errors="ignore")
+            except Exception:
+                text = resp.content.decode("utf-8", errors="ignore")
+        return text
+    except Exception:
+        return None
+
+def readability_extract(url: str, timeout: float = 10.0) -> Optional[str]:
+    html = fetch_article_html(url, timeout=timeout)
+    if not html:
+        return None
+    try:
+        doc = Document(html)
+        content_html = doc.summary(html_partial=True)
+        text = html_to_text(content_html)
+        return text or None
+    except Exception:
+        return None
+
+def enrich_records_with_article_body(records: List[Dict[str, Any]], deadline: datetime, threads: int, request_timeout: float, verbose: bool) -> List[Dict[str, Any]]:
+    """Ensure each record has non-empty 'article-body'. Prefer RSS content; then summary; else fetch + Readability.
+    Honors the provided deadline; items that still lack body text are dropped.
+    """
+    need_fetch: List[Dict[str, Any]] = []
+    enriched: List[Dict[str, Any]] = []
+
+    # Pass 1: use RSS-provided content/summary
+    for r in records:
+        body = ""
+        if r.get("content_html"):
+            body = html_to_text(r["content_html"]) or ""
+        if (not body) and r.get("summary"):
+            body = html_to_text(r["summary"]) or ""
+        if body:
+            r["article-body"] = body
+            enriched.append(r)
+        else:
+            need_fetch.append(r)
+
+    # If time is up or nothing to fetch, return what we have
+    if datetime.now() >= deadline or not need_fetch:
+        return enriched
+
+    # Pass 2: fetch remaining articles concurrently (within time budget)
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+            fut_map = {}
+            for r in need_fetch:
+                time_left = (deadline - datetime.now()).total_seconds()
+                if time_left <= 0:
+                    break
+                fut = ex.submit(readability_extract, r.get("link"), min(request_timeout, max(0.1, time_left)))
+                fut_map[fut] = r
+
+            while fut_map and datetime.now() < deadline:
+                time_left = (deadline - datetime.now()).total_seconds()
+                if time_left <= 0:
+                    break
+                done, _ = wait(list(fut_map.keys()), timeout=min(1.0, time_left), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    r = fut_map.pop(fut)
+                    try:
+                        text = fut.result()
+                        if text:
+                            r["article-body"] = text
+                            enriched.append(r)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return enriched
 
 
 def load_extra_feeds(path: str, verbose: bool) -> List[str]:
@@ -484,6 +580,10 @@ def main():
         except Exception:
             pass
 
+        # Ensure each record has main article text within the remaining budget
+        records_for_minute = enrich_records_with_article_body(
+            records_for_minute, deadline, args.threads, args.request_timeout, args.verbose
+        )
         # Write ONLY previous minute’s items as a single JSON array file:
         # ./data/news/YYMMDDHHMM.json
         if records_for_minute:
@@ -502,7 +602,7 @@ def main():
 
         if args.verbose:
             took = (datetime.now() - cycle_start_local).total_seconds()
-            log(f"Fetched ~{fetched_items} items; saved {len(records_for_minute)} to {bucket_name}.json in {took:.2f}s.", True)
+            log(f"Fetched ~{fetched_items} items; saved {len(records_for_minute)} (with article-body) to {bucket_name}.json in {took:.2f}s.", True)
 
         if STOP:
             break
