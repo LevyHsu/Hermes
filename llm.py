@@ -44,26 +44,40 @@ import signal
 import sqlite3
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# OpenAI SDK works with LM Studio's OpenAI-compatible endpoint
-# See: https://lmstudio.ai/docs/app/api/endpoints/openai and
-# https://cookbook.openai.com/articles/gpt-oss/run-locally-lmstudio
-from openai import OpenAI
+# lmstudio-python SDK (native) — use LM Studio's convenience API
+# Docs: https://lmstudio.ai/docs/python/getting-started/project-setup
+# and Structured Response: https://lmstudio.ai/docs/python/llm-prediction/structured-response
+import lmstudio as lms
 
 DATA_DIR = Path("./data")
 NEWS_DIR = DATA_DIR / "news"
 LLM_OUT_DIR = DATA_DIR / "llm"
 LISTING_DIR = DATA_DIR / "us-stock-listing"
 DECISIONS_DB = LLM_OUT_DIR / ".decisions.db"
+# Store per-news processed JSON directly under data/llm/<YYMMDDHHMM>/<news_id>.json
+PROCESSED_DIR = LLM_OUT_DIR
 
 DEFAULT_MODEL = "openai/gpt-oss-120b"
 ALT_MODEL = "openai/gpt-oss-20b"
-DEFAULT_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
-DEFAULT_API_KEY = os.environ.get("LMSTUDIO_API_KEY", "not-needed")  # LM Studio ignores API keys
+DEFAULT_SERVER_HOST = os.environ.get("LMSTUDIO_SERVER_HOST", "localhost:1234")
+
+# ----------------------
+# Server host normalization
+# ----------------------
+_HOST_RE = re.compile(r"^(?:https?://)?([^/]+?)(?:/.*)?$")
+def normalize_server_host(host: str) -> str:
+    if not host:
+        return "localhost:1234"
+    m = _HOST_RE.match(host.strip())
+    if not m:
+        return host
+    return m.group(1)
 
 # ----------------------
 # Small utilities
@@ -187,10 +201,14 @@ def find_by_name_partial(listings: Dict[str, ListingItem], query: str, limit: in
 # ----------------------
 
 def latest_news_file() -> Optional[Path]:
-    files = [p for p in NEWS_DIR.glob("*.json") if p.name.isdigit() and p.suffix == ".json"]
+    # Accept files named YYMMDDHHMM.json (10 digits in the stem)
+    files: List[Path] = []
+    for p in NEWS_DIR.glob("*.json"):
+        stem = p.stem
+        if len(stem) == 10 and stem.isdigit():
+            files.append(p)
     if not files:
         return None
-    # sort by filename (YYMMDDHHMM.json lexicographically equals chronological)
     files.sort()
     return files[-1]
 
@@ -213,11 +231,11 @@ SYSTEM_TEMPLATE = (
     "For each, output an action and a confidence index (0-100).\n\n"
     "Rules:\n"
     "- Consider first-order impact (issuer mentioned, direct competitors, suppliers, ETFs).\n"
-    "- If impact is ambiguous or minor, either omit or assign low confidence.\n"
+    "- If impact is ambiguous, generic personal finance content, opinion/column with no issuer impact, or otherwise immaterial, return ZERO decisions.\n"
     "- Only include tickers that are listed in the provided US listings (you can call tools to check).\n"
     "- BUY means open/accumulate long; SELL means reduce/close long (or short).\n"
     "- Confidence 100 = act now; 0 = not sure.\n"
-    "- Keep rationales concise (<= 240 chars each).\n"
+    "- Each decision MUST include a short non-empty reason (<= 240 chars).\n"
     "- Output JSON ONLY matching the response schema. No commentary."
 )
 
@@ -225,7 +243,10 @@ RESPONSE_SCHEMA_EXAMPLE = {
     "news_id": "<string>",
     "news_title": "<string>",
     "link": "<url>",
+    "relevance": "none",  # one of: none, low, medium, high
+    "relevance_reason": "<short reason>",
     "decisions": [
+        # 0 to 10 items
         {
             "ticker": "AAPL",
             "action": "BUY",  # or "SELL"
@@ -234,6 +255,169 @@ RESPONSE_SCHEMA_EXAMPLE = {
         }
     ]
 }
+def build_response_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "news_id": {"type": "string"},
+            "news_title": {"type": "string", "minLength": 1},
+            "link": {"type": "string", "minLength": 1, "pattern": r"^https?://.*$"},
+            "relevance": {"type": "string", "enum": ["none", "low", "medium", "high"]},
+            "relevance_reason": {"type": "string"},
+            "decisions": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ticker": {"type": "string", "pattern": r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$"},
+                        "action": {"type": "string", "enum": ["BUY", "SELL"]},
+                        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "reason": {"type": "string", "minLength": 3}
+                    },
+                    "required": ["ticker", "action", "confidence"],
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["news_id", "news_title", "link", "relevance", "relevance_reason", "decisions"],
+        "additionalProperties": False
+    }
+
+
+# ----------------------
+# Text normalization helpers
+# ----------------------
+INVISIBLE_CATEGORIES = {"Cf", "Cc", "Cs"}
+def clean_text(s: Any) -> Any:
+    """Normalize and remove invisible/control characters from strings.
+    Returns input unchanged if it is not a string.
+    """
+    if not isinstance(s, str):
+        return s
+    # Normalize width/compatibility first
+    s = unicodedata.normalize("NFKC", s)
+    # Strip characters in Unicode categories: Format (Cf), Control (Cc), Surrogate (Cs)
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in INVISIBLE_CATEGORIES)
+    # Trim redundant whitespace
+    return s.strip()
+
+# ----------------------
+# Core processing
+# ----------------------
+
+# Normalizer for model output: ensures required fields, coerces structure, sets relevance to "none" if no decisions.
+def normalize_model_output(nid: str, title: str, link: str, parsed: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if isinstance(parsed, dict):
+        out.update(parsed)
+
+    # Always trust our source metadata over model-provided copies
+    out["news_id"] = nid
+    out["news_title"] = clean_text(title)
+    out["link"] = clean_text(link)
+
+    # decisions
+    decisions = out.get("decisions")
+    if not isinstance(decisions, list):
+        decisions = []
+    norm_decisions = []
+    for d in decisions[:10]:
+        if not isinstance(d, dict):
+            continue
+        tk = clean_text((d.get("ticker") or "").upper())
+        if not tk:
+            continue
+        act = clean_text((d.get("action") or "").upper())
+        if act not in {"BUY", "SELL"}:
+            continue
+        # Drop unknown/unlisted tickers
+        try:
+            if GLOBAL_LISTINGS and tk not in GLOBAL_LISTINGS:
+                continue
+        except NameError:
+            pass
+        try:
+            conf = int(d.get("confidence", 0))
+        except Exception:
+            conf = 0
+        conf = max(0, min(100, conf))
+        raw_reason = d.get("reason") or ""
+        reason = clean_text(raw_reason) if raw_reason else ""
+        if not reason:
+            # Fallback if model leaves it blank
+            reason = "Model provided no rationale; included due to article context."
+        norm_decisions.append({
+            "ticker": tk,
+            "action": act,
+            "confidence": conf,
+            "reason": reason[:240],
+        })
+    out["decisions"] = norm_decisions
+
+    # relevance
+    rel = out.get("relevance")
+    if rel not in {"none", "low", "medium", "high"}:
+        rel = "none" if not norm_decisions else "low"
+    out["relevance"] = rel
+
+    # relevance reason
+    rr = out.get("relevance_reason") or ""
+    rr = clean_text(rr)
+    if not rr:
+        if rel == "none" and not norm_decisions:
+            rr = "No directly affected US-listed issuer; generic/irrelevant to equities."
+        else:
+            rr = "Model-provided decisions imply some impact."
+    out["relevance_reason"] = rr[:280]
+
+    return out
+def write_processed_record(minute_key: str, news_id: str, record: Dict[str, Any]):
+    # Create ./data/llm/<YYMMDDHHMM>/ and write <news_id>.json inside it
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    minute_dir = PROCESSED_DIR / minute_key
+    minute_dir.mkdir(parents=True, exist_ok=True)
+    # use the raw id (hex) as filename; fallback to safe name
+    fname = f"{news_id}.json" if news_id else "unknown.json"
+    out_path = minute_dir / fname
+    tmp = out_path.with_suffix(".tmp")
+
+    # Deep sanitize selected string fields to eliminate invisible chars
+    rec = {
+        **record,
+        "news_id": clean_text(record.get("news_id")),
+        "minute": clean_text(record.get("minute")),
+        "model": clean_text(record.get("model")),
+        "effort": clean_text(record.get("effort")),
+    }
+    if isinstance(record.get("input"), dict):
+        rec["input"] = {
+            "title": clean_text(record["input"].get("title")),
+            "link": clean_text(record["input"].get("link")),
+        }
+    if isinstance(record.get("output"), dict):
+        outp = dict(record["output"])  # shallow copy
+        outp["news_id"] = clean_text(outp.get("news_id"))
+        outp["news_title"] = clean_text(outp.get("news_title"))
+        outp["link"] = clean_text(outp.get("link"))
+        outp["relevance"] = clean_text(outp.get("relevance"))
+        outp["relevance_reason"] = clean_text(outp.get("relevance_reason"))
+        decs = []
+        for d in outp.get("decisions", []) or []:
+            if not isinstance(d, dict):
+                continue
+            decs.append({
+                "ticker": clean_text(d.get("ticker")),
+                "action": clean_text(d.get("action")),
+                "confidence": int(d.get("confidence", 0)),
+                "reason": clean_text(d.get("reason"))[:240],
+            })
+        outp["decisions"] = decs
+        rec["output"] = outp
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, out_path)
 
 
 TICKER_RE = re.compile(r"\b[A-Z]{1,5}(?:\.[A-Z]{1,2})?\b")
@@ -321,78 +505,57 @@ def execute_tool(name: str, args: Dict[str, Any], listings: Dict[str, ListingIte
 
 
 # ----------------------
-# LLM client
+# LLM client (lmstudio-python SDK)
 # ----------------------
 
 class LMStudioClient:
-    def __init__(self, base_url: str, api_key: str, model: str, effort: str = "medium", verbose: bool = False):
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
-        self.model = model
+    def __init__(self, server_host: str, model: str, effort: str = "medium", verbose: bool = False):
+        # Must be the first call before using convenience API. See docs.
+        # https://lmstudio.ai/docs/python/getting-started/project-setup
+        host = normalize_server_host(server_host)
+        lms.configure_default_client(host)
+        self.model = lms.llm(model) if model else lms.llm()
+        self.host = host
         if effort not in {"low", "medium", "high"}:
             effort = "medium"
         self.effort = effort
         self.verbose = verbose
 
-    def list_models(self) -> List[str]:
+    def list_models_loaded(self) -> List[str]:
         try:
-            res = self.client.models.list()
-            return [m.id for m in getattr(res, "data", [])]
+            handles = lms.list_loaded_models()  # all types
+            out: List[str] = []
+            for h in handles:
+                try:
+                    info = h.get_info()
+                    ident = info.get("identifier") or info.get("modelKey") or info.get("displayName")
+                    if ident:
+                        out.append(str(ident))
+                except Exception:
+                    pass
+            # Fallback: query the currently selected handle's info
+            if not out and self.model is not None:
+                try:
+                    info = self.model.get_info()
+                    ident = info.get("identifier") or info.get("modelKey") or info.get("displayName")
+                    if ident:
+                        out.append(str(ident))
+                except Exception:
+                    pass
+            return out
         except Exception:
             return []
 
-    def chat_json(self, messages: List[Dict[str, Any]], tools=None, max_rounds: int = 4) -> str:
-        """Run a tool-call loop until we get a final JSON response string."""
-        tools = tools or []
-        round_idx = 0
-        chat = list(messages)
-        while round_idx < max_rounds:
-            round_idx += 1
-            if self.verbose:
-                log(f"LLM round {round_idx}…", True)
-            try:
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=chat,
-                    tools=tools if tools else None,
-                    tool_choice="auto" if tools else None,
-                    temperature=0.2,
-                    max_tokens=800,
-                    response_format={"type": "json_object"},
-                    reasoning={"effort": self.effort},  # gpt-oss accepts the field; ignored if unsupported
-                )
-            except Exception as e:
-                raise RuntimeError(f"Chat call failed: {e}")
+    def _effort_to_max_tokens(self) -> int:
+        return {"low": 400, "medium": 800, "high": 1200}.get(self.effort, 800)
 
-            choice = resp.choices[0]
-            msg = choice.message
-
-            # Handle tool calls if any
-            tool_calls = getattr(msg, "tool_calls", None)
-            if tool_calls:
-                chat.append({"role": "assistant", "tool_calls": [tc.model_dump() for tc in tool_calls]})
-                for tc in tool_calls:
-                    name = tc.function.name
-                    args = json.loads(tc.function.arguments or "{}")
-                    tool_output = execute_tool(name, args, GLOBAL_LISTINGS)
-                    chat.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": name,
-                        "content": tool_output,
-                    })
-                # Continue loop
-                continue
-
-            # No tool calls: expect JSON content
-            content = (msg.content or "").strip()
-            if content:
-                return content
-
-            # Fallback: stop
-            if choice.finish_reason == "stop":
-                return "{}"
-        # Max rounds reached
-        return "{}"
+    def respond_structured(self, messages: List[Dict[str, Any]], schema: Dict[str, Any]) -> Dict[str, Any]:
+        chat = {"messages": messages}
+        cfg = {"temperature": 0.2, "maxTokens": self._effort_to_max_tokens()}
+        # Structured output: result.parsed is a dict conforming to the schema.
+        # https://lmstudio.ai/docs/python/llm-prediction/structured-response
+        result = self.model.respond(chat, response_format=schema, config=cfg)
+        return getattr(result, "parsed", {}) or {}
 
 
 # ----------------------
@@ -419,6 +582,7 @@ def build_messages(listings: Dict[str, ListingItem], news: Dict[str, Any]) -> Li
         "response_schema": RESPONSE_SCHEMA_EXAMPLE,
         "instructions": (
             "Return only valid JSON. Include 0–10 items in 'decisions'. "
+            "If the article is generic personal finance/advice or otherwise irrelevant to listed issuers, set 'relevance'='none' and return an empty 'decisions' array. "
             "Use tools to validate tickers against the listings if unsure."
         ),
         # Keep the body last
@@ -432,9 +596,24 @@ def write_decisions(minute_key: str, results: List[Dict[str, Any]]):
     out_dir = LLM_OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{minute_key}.json"
+
+    # Merge with existing if present
+    existing: List[Dict[str, Any]] = []
+    if out_path.exists():
+        try:
+            with open(out_path, "r", encoding="utf-8") as rf:
+                prev = json.load(rf)
+                if isinstance(prev, list):
+                    existing = prev
+        except Exception:
+            existing = []
+    existing_ids = {str(r.get("news_id")) for r in existing}
+    new_unique = [r for r in results if str(r.get("news_id")) not in existing_ids]
+    combined = existing + new_unique
+
     tmp = out_path.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+        json.dump(combined, f, ensure_ascii=False, indent=2)
     os.replace(tmp, out_path)
 
 
@@ -447,11 +626,10 @@ GLOBAL_LISTINGS: Dict[str, ListingItem] = {}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM decision engine using LM Studio (OpenAI-compatible API)")
+    parser = argparse.ArgumentParser(description="LLM decision engine using LM Studio (native SDK)")
     parser.add_argument("--model", default=DEFAULT_MODEL, choices=[DEFAULT_MODEL, ALT_MODEL], help="Model id to use")
     parser.add_argument("--effort", default="medium", choices=["low", "medium", "high"], help="Reasoning effort")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="LM Studio OpenAI-compatible base URL")
-    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key (ignored by LM Studio)")
+    parser.add_argument("--server-host", default=DEFAULT_SERVER_HOST, help="LM Studio server host:port (e.g., localhost:1234 or 192.168.0.198:1234). 'http://' prefix is accepted and will be normalized.")
     parser.add_argument("--poll-interval", type=float, default=10.0, help="Seconds between checks for new news")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
@@ -465,18 +643,18 @@ def main():
     if args.verbose:
         log(f"Loaded {len(GLOBAL_LISTINGS)} listings.", True)
 
-    # Init client and sanity-check models list
-    client = LMStudioClient(base_url=args.base_url, api_key=args.api_key, model=args.model, effort=args.effort, verbose=args.verbose)
-    models = client.list_models()
+    # Init client and sanity-check loaded models
+    server_host_norm = normalize_server_host(args.server_host)
     if args.verbose:
-        if models:
-            log(f"LM Studio models visible: {len(models)} (showing first 5): {models[:5]}", True)
+        log(f"Connecting to LM Studio at {server_host_norm}", True)
+    client = LMStudioClient(server_host=server_host_norm, model=args.model, effort=args.effort, verbose=args.verbose)
+    loaded = client.list_models_loaded()
+    if args.verbose:
+        if loaded:
+            log(f"LM Studio loaded models on {server_host_norm}: {len(loaded)} (showing first 5): {loaded[:5]}", True)
         else:
-            log("Could not list models from LM Studio — ensure the API server is running.", True)
+            log(f"No loaded models reported from {server_host_norm} — ensure the server is reachable, 'Serve on Local Network' is enabled, and a model is loaded.", True)
 
-    last_seen_news_file: Optional[Path] = None
-
-    # Main loop
     # Main loop: always use the latest news file available
     try:
         while True:
@@ -490,6 +668,8 @@ def main():
             log(f"Using latest news file {nf.name} (minute {minute_key})", args.verbose)
 
             news_items = load_news(nf)
+            total_items = len(news_items)
+            unseen = 0
             decisions: List[Dict[str, Any]] = []
 
             for item in news_items:
@@ -498,14 +678,19 @@ def main():
                     continue
                 if already_processed(con, nid):
                     continue
+                unseen += 1
 
                 # Build messages and ask the model
                 messages = build_messages(GLOBAL_LISTINGS, item)
+                schema = build_response_schema()
+                if args.verbose:
+                    log("LLM round 1…", True)
                 try:
-                    model_json = client.chat_json(messages, tools=tool_schemas(), max_rounds=4)
-                    parsed = json.loads(model_json)
+                    parsed = client.respond_structured(messages, schema)
                 except Exception as e:
-                    parsed = {"error": repr(e), "news_id": nid}
+                    parsed = {"error": repr(e), "decisions": [], "relevance": "none", "relevance_reason": "Model call failed."}
+
+                normalized = normalize_model_output(nid, item.get("title") or "", item.get("link") or "", parsed)
 
                 record = {
                     "news_id": nid,
@@ -517,10 +702,16 @@ def main():
                         "title": item.get("title"),
                         "link": item.get("link"),
                     },
-                    "output": parsed,
+                    "output": normalized,
                 }
+
+                # Write per-news processed JSON immediately
+                write_processed_record(minute_key, nid, record)
+
                 decisions.append(record)
                 mark_processed(con, nid, minute_key)
+
+            log(f"Latest file has {total_items} item(s); unseen this pass: {unseen}.", args.verbose)
 
             if decisions:
                 write_decisions(minute_key, decisions)
