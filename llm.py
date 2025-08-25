@@ -42,6 +42,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
+import feedparser
+
 # lmstudio-python SDK (native)
 # Docs: https://lmstudio.ai/docs/python/getting-started/project-setup
 #       https://lmstudio.ai/docs/python/llm-prediction/structured-response
@@ -369,12 +372,23 @@ def write_processed_record(minute_key: str, news_id: str, record: Dict[str, Any]
         for d in outp.get("decisions", []) or []:
             if not isinstance(d, dict):
                 continue
-            decs.append({
+            entry = {
                 "ticker": clean_text(d.get("ticker")),
                 "action": clean_text(d.get("action")),
                 "confidence": int(d.get("confidence", 0)),
                 "reason": clean_text(d.get("reason"))[:240],
-            })
+            }
+            # Optional refined fields
+            if d.get("refined_confidence") is not None:
+                try:
+                    entry["refined_confidence"] = int(d.get("refined_confidence"))
+                except Exception:
+                    pass
+            if d.get("refined_reason"):
+                entry["refined_reason"] = clean_text(d.get("refined_reason"))[:240]
+            if d.get("refined_at_utc"):
+                entry["refined_at_utc"] = clean_text(d.get("refined_at_utc"))
+            decs.append(entry)
         outp["decisions"] = decs
         rec["output"] = outp
 
@@ -395,6 +409,232 @@ def extract_candidate_tickers(text: str, listings: Dict[str, ListingItem]) -> Li
     return sorted(found)
 
 # ----------------------
+# Enrichment: Google News RSS + Yahoo Finance chart API
+# ----------------------
+
+HTTP_TIMEOUT = (8, 15)  # (connect, read) seconds
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    )
+}
+
+def google_news_rss(company: str, ticker: str, days: int, max_items: int = 10) -> List[Dict[str, Any]]:
+    """Query Google News RSS for the last N days using a robust query of name OR ticker."""
+    # Example: https://news.google.com/rss/search?q=AAPL%20OR%20%22Apple%20Inc%22%20when%3A30d&hl=en-US&gl=US&ceid=US:en
+    q = f"{ticker} OR \"{company}\" when:{days}d"
+    url = (
+        "https://news.google.com/rss/search?" 
+        + f"q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
+    )
+    try:
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        fp = feedparser.parse(resp.content)
+        items = []
+        for e in fp.entries[: max_items * 2]:  # oversample then trim uniques
+            title = e.get("title", "").strip()
+            link = (e.get("link") or "").strip()
+            published = e.get("published", "") or e.get("updated", "")
+            source = ""
+            if "source" in e and isinstance(e.source, dict):
+                source = e.source.get("title") or ""
+            if title and link:
+                items.append({
+                    "title": clean_text(title),
+                    "link": clean_text(link),
+                    "published": clean_text(published),
+                    "source": clean_text(source),
+                })
+        # Deduplicate by link
+        seen = set()
+        deduped = []
+        for it in items:
+            if it["link"] in seen:
+                continue
+            seen.add(it["link"])
+            deduped.append(it)
+        return deduped[:max_items]
+    except Exception:
+        return []
+
+def yahoo_symbol_from(ticker: str) -> str:
+    # Yahoo uses '-' instead of '.' for class shares (e.g., BRK-B)
+    return ticker.replace(".", "-")
+
+def yahoo_prices(ticker: str, days: int) -> Dict[str, Any]:
+    """Fetch recent price series from Yahoo chart endpoint.
+    Returns {meta: {...}, points: [{t, c, v}], interval: str} or {} on failure.
+    """
+    sym = yahoo_symbol_from(ticker)
+    interval = "5m" if days <= 7 else "1h"
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?"
+        f"range={days}d&interval={interval}&includePrePost=true"
+    )
+    try:
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        result = (data.get("chart", {}).get("result") or [None])[0]
+        if not result:
+            return {}
+        meta = result.get("meta", {})
+        tzoff = int(meta.get("gmtoffset", 0))
+        ts = result.get("timestamp") or []
+        quotes = (result.get("indicators", {}).get("quote") or [{}])[0]
+        closes = quotes.get("close") or []
+        vols = quotes.get("volume") or []
+        points = []
+        for i, t in enumerate(ts):
+            c = closes[i] if i < len(closes) else None
+            v = vols[i] if i < len(vols) else None
+            if c is None:
+                continue
+            # Convert epoch (sec) + tz offset to ISO UTC string for consistency
+            iso = datetime.fromtimestamp(int(t), tz=timezone.utc).isoformat(timespec="seconds")
+            points.append({"t": iso, "c": float(c), "v": int(v) if v is not None else None})
+        return {
+            "meta": {"symbol": sym, "interval": interval, "timezone_offset": tzoff},
+            "points": points,
+            "interval": interval,
+        }
+    except Exception:
+        return {}
+
+def summarize_prices(points: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not points:
+        return {}
+    first = points[0]["c"]
+    last = points[-1]["c"]
+    chg = (last - first)
+    pct = (chg / first * 100.0) if first else 0.0
+    return {"first": first, "last": last, "abs_change": chg, "pct_change": pct}
+
+REFINE_SYSTEM = (
+    "You are a second-pass verifier for trading signals. Given the original decision "
+    "and supplemental evidence (recent headlines and recent price action), output a revised "
+    "confidence for the SAME action on the SAME ticker. Additionally:\n"
+    "1) Estimate a *near-term horizon* in HOURS (positive integer) that is appropriate for this setup/impact/liquidity.\n"
+    "2) Estimate the *expected high price* within that horizon and optionally provide up to two intermediate anchors "
+    "(price and confidence) between the current price and the expected high.\n\n"
+    "Rules:\n"
+    "- Keep the action unchanged.\n"
+    "- 'horizon_hours' must be a positive integer (e.g., 1–72 hours is typical; longer only if clearly justified by the article).\n"
+    "- 'expected_high_price' must be a positive float in the same currency as the input prices.\n"
+    "- Confidence is 0–100. Assume confidence decays to **0 at the expected_high_price** if action=BUY; "
+    "if action=SELL, assume confidence decays to 0 at the expected_low_price (still use the field name 'expected_high_price' but it may be below current).\n"
+    "- Anchors, if provided, must be strictly between the current price and the expected_high_price and have confidence between 0 and the revised confidence.\n"
+    "Return JSON only."
+)
+
+def build_refine_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "ticker": {"type": "string"},
+            "action": {"type": "string", "enum": ["BUY", "SELL"]},
+            "previous_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+            "revised_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+            "reasoning": {"type": "string", "minLength": 5},
+            "expected_high_price": {"type": "number", "minimum": 0},
+            "anchors": {
+                "type": "array",
+                "maxItems": 2,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "price": {"type": "number"},
+                        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "label": {"type": "string"}
+                    },
+                    "required": ["price", "confidence"],
+                    "additionalProperties": False
+                }
+            },
+            "horizon_hours": {"type": "integer", "minimum": 1, "maximum": 240}
+        },
+        "required": ["ticker", "action", "previous_confidence", "revised_confidence", "reasoning", "horizon_hours"],
+        "additionalProperties": False
+    }
+
+def build_refine_messages(news_item: Dict[str, Any], decision: Dict[str, Any], gnews: List[Dict[str, Any]], yprices: Dict[str, Any]) -> List[Dict[str, Any]]:
+    price_summary = summarize_prices(yprices.get("points", []))
+    payload = {
+        "original_news": {
+            "title": news_item.get("title"),
+            "link": news_item.get("link"),
+            "published_at_utc": news_item.get("published_at_utc"),
+        },
+        "decision": decision,
+        "google_news": gnews,
+        "price_summary": price_summary,
+        "price_points_tail": yprices.get("points", [])[-50:],
+        "current_price": (price_summary.get("last") if isinstance(price_summary, dict) else None),
+        "instructions": (
+            "Select a plausible near-term 'horizon_hours' based on article severity and recent price path. "
+            "Estimate expected_high_price within that horizon. Confidence must be 0 at the expected high price (for BUY). "
+            "Optionally provide up to 2 anchors between current price and expected high."
+        )
+    }
+    return [
+        {"role": "system", "content": REFINE_SYSTEM},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+    ]
+def build_confidence_curve(current_price: Optional[float], current_conf: int, expected_high: Optional[float], anchors: Optional[List[Dict[str, Any]]], steps: int, action: str) -> Dict[str, Any]:
+    """
+    Build a monotonic curve from current price to expected_high where confidence decays to 0 at the endpoint.
+    For SELL actions, the expected_high may be below current; we still treat it as the terminal price where confidence=0.
+    Returns {"expected_high": float, "curve": [{"price":p,"confidence":c}, ...]}
+    """
+    try:
+        steps = max(2, int(steps))
+    except Exception:
+        steps = 5
+    if current_price is None or not isinstance(current_price, (int, float)) or current_price <= 0:
+        return {"expected_high": None, "curve": []}
+    # Fallback expected_high if missing or invalid: extrapolate using recent pct change or +1%
+    if expected_high is None or not isinstance(expected_high, (int, float)) or expected_high <= 0 or expected_high == current_price:
+        # simple fallback: 1% away from current in the direction of action
+        bump = 0.01 * current_price
+        expected_high = (current_price + bump) if (str(action).upper() == "BUY") else (current_price - bump)
+    # Normalize anchors
+    norm_anchors: List[Tuple[float, int]] = []
+    if anchors:
+        for a in anchors:
+            try:
+                ap = float(a.get("price"))
+                ac = int(a.get("confidence"))
+                norm_anchors.append((ap, max(0, min(100, ac))))
+            except Exception:
+                continue
+    # Build base grid
+    prices: List[float] = []
+    if steps <= 2:
+        prices = [current_price, expected_high]
+    else:
+        for i in range(steps):
+            t = i / (steps - 1)
+            p = current_price + (expected_high - current_price) * t
+            prices.append(p)
+    # Seed confidences with linear decay as default
+    confs = [max(0, min(100, int(round(current_conf * (1 - (i / (len(prices) - 1))))))) for i in range(len(prices))]
+    # Blend in anchors: snap confidence at nearest price index to anchor confidence, then ensure monotonic non-increasing toward endpoint
+    for ap, ac in norm_anchors:
+        # find nearest index
+        idx = min(range(len(prices)), key=lambda k: abs(prices[k] - ap))
+        confs[idx] = max(0, min(100, ac))
+    # Enforce monotone decay to 0 at endpoint
+    confs[0] = max(0, min(100, int(current_conf)))
+    confs[-1] = 0
+    for i in range(1, len(confs)):
+        if confs[i] > confs[i-1]:
+            confs[i] = confs[i-1]
+    return {"expected_high": float(expected_high), "curve": [{"price": float(prices[i]), "confidence": int(confs[i])} for i in range(len(prices))]}
+
+# ----------------------
 # LLM client (lmstudio-python SDK)
 # ----------------------
 
@@ -409,30 +649,6 @@ class LMStudioClient:
         self.host = host
         self.verbose = verbose
 
-    def list_models_loaded(self) -> List[str]:
-        try:
-            handles = lms.list_loaded_models("llm")  # list only LLMs
-            out: List[str] = []
-            for h in handles:
-                try:
-                    info = h.get_info()
-                    ident = info.get("identifier") or info.get("modelKey") or info.get("displayName")
-                    if ident:
-                        out.append(str(ident))
-                except Exception:
-                    pass
-            # Fallback: query the currently selected handle's info
-            if not out and self.model is not None:
-                try:
-                    info = self.model.get_info()
-                    ident = info.get("identifier") or info.get("modelKey") or info.get("displayName")
-                    if ident:
-                        out.append(str(ident))
-                except Exception:
-                    pass
-            return out
-        except Exception:
-            return []
 
     def get_current_model_identifier(self) -> Optional[str]:
         try:
@@ -522,6 +738,12 @@ def main():
     )
     parser.add_argument("--poll-interval", type=float, default=10.0, help="Seconds between checks for new news")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    parser.add_argument("--conf-threshold", type=int, default=60, help="Confidence threshold (inclusive) to trigger enrichment & refinement")
+    parser.add_argument("--news-window-days", type=int, default=30, help="Days of Google News headlines to fetch per ticker")
+    parser.add_argument("--price-window-days", type=int, default=7, help="Days of recent price history to fetch per ticker")
+    parser.add_argument("--max-news", type=int, default=10, help="Max Google News items to include in refinement")
+    # REMOVED: parser.add_argument("--horizon-hours", type=int, default=6, help="Near-term horizon for expected-high estimate (hours)")
+    parser.add_argument("--confidence-curve-steps", type=int, default=5, help="Number of points (including endpoints) for the price→confidence curve")
     args = parser.parse_args()
 
     ensure_dirs()
@@ -538,15 +760,8 @@ def main():
     if args.verbose:
         log(f"Connecting to LM Studio at {server_host_norm}", True)
     client = LMStudioClient(server_host=server_host_norm, verbose=args.verbose)
-    current_model = client.get_current_model_identifier()
-    loaded = client.list_models_loaded()
     if args.verbose:
-        if current_model:
-            log(f"Active LM Studio model: {current_model} (server {server_host_norm})", True)
-        else:
-            log(f"LM Studio ready at {server_host_norm}; proceeding without model listing (will confirm via inference).", True)
-        if loaded:
-            log(f"Loaded LLMs reported: {len(loaded)} (first 5): {loaded[:5]}", True)
+        log(f"LM Studio client initialized for {server_host_norm}. Inference will confirm connectivity/model selection.", True)
 
     # Main loop: always use the latest news file available
     try:
@@ -584,6 +799,82 @@ def main():
 
                 normalized = normalize_model_output(nid, item.get("title") or "", item.get("link") or "", parsed)
 
+                # --- Enrichment + refinement for high-confidence decisions ---
+                try:
+                    threshold = max(0, min(100, int(args.conf_threshold)))
+                except Exception:
+                    threshold = 60
+                refine_schema = build_refine_schema()
+
+                # Update normalized decisions in-place with refined results
+                for idx, dec in enumerate(list(normalized.get("decisions", []))):
+                    try:
+                        if int(dec.get("confidence", 0)) < threshold:
+                            continue
+                    except Exception:
+                        continue
+                    ticker = dec.get("ticker")
+                    if not ticker:
+                        continue
+                    listing = GLOBAL_LISTINGS.get(ticker)
+                    company = listing.name if listing and listing.name else ticker
+
+                    # Fetch enrichment data
+                    gnews = google_news_rss(company, ticker, int(args.news_window_days), max_items=int(args.max_news))
+                    yprices = yahoo_prices(ticker, int(args.price_window_days))
+
+                    # Ask the model to revise confidence
+                    refine_msgs = build_refine_messages(item, dec, gnews, yprices)
+                    try:
+                        refined = client.respond_structured(refine_msgs, refine_schema)
+                    except Exception as e:
+                        refined = {
+                            "ticker": ticker,
+                            "action": dec.get("action"),
+                            "previous_confidence": int(dec.get("confidence", 0)),
+                            "revised_confidence": int(dec.get("confidence", 0)),
+                            "reasoning": f"Refinement failed: {e!r}",
+                        }
+
+                    # Persist refined confidence & reason into the decision
+                    try:
+                        prev_c = int(refined.get("previous_confidence", dec.get("confidence", 0)))
+                        new_c = int(refined.get("revised_confidence", prev_c))
+                    except Exception:
+                        prev_c = int(dec.get("confidence", 0))
+                        new_c = prev_c
+                    reason_text = refined.get("reasoning", "")
+
+                    # Update the normalized decision entry
+                    normalized["decisions"][idx]["refined_confidence"] = new_c
+                    if reason_text:
+                        normalized["decisions"][idx]["refined_reason"] = clean_text(str(reason_text))[:240]
+                    normalized["decisions"][idx]["refined_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+                    # Build and attach a price→confidence curve
+                    current_price = (summarize_prices(yprices.get("points", [])).get("last") if isinstance(yprices, dict) else None)
+                    expected_high = refined.get("expected_high_price")
+                    anchors = refined.get("anchors")
+                    act = (refined.get("action") or dec.get("action") or "").upper()
+                    curve = build_confidence_curve(current_price, new_c, expected_high, anchors, int(args.confidence_curve_steps), act)
+                    chosen_h = refined.get("horizon_hours")
+                    try:
+                        chosen_h = int(chosen_h) if chosen_h is not None else 6
+                    except Exception:
+                        chosen_h = 6
+                    normalized["decisions"][idx]["price_path"] = {
+                        "horizon_hours": chosen_h,
+                        "expected_high": curve.get("expected_high"),
+                        "curve": curve.get("curve", [])
+                    }
+
+                    # Print on screen
+                    try:
+                        log(f"Refined {ticker} {act}: {prev_c}% -> {new_c}% — {str(reason_text)[:160]}", True)
+                    except Exception:
+                        log(f"Refined {ticker}: (unable to print refined output)", True)
+
+                # Build record AFTER refinement so JSON includes refined fields
                 record = {
                     "news_id": nid,
                     "minute": minute_key,
@@ -596,7 +887,7 @@ def main():
                     "output": normalized,
                 }
 
-                # Write per-news processed JSON immediately
+                # Write per-news processed JSON (now contains refined fields)
                 write_processed_record(minute_key, nid, record)
 
                 decisions.append(record)
