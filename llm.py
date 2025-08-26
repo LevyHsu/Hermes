@@ -837,6 +837,8 @@ def main():
                        help="Verbose output")
     parser.add_argument("--test", action="store_true",
                        help="Run test with data/news/2508242333.json")
+    parser.add_argument("--news-file", type=str, default=None,
+                       help="Specific news file to process")
     
     args = parser.parse_args()
     
@@ -859,6 +861,18 @@ def main():
             print(f"Test file not found: {news_file}")
             sys.exit(1)
         log(f"Using test file: {news_file}", args.verbose)
+    elif args.news_file:
+        news_file = Path(args.news_file)
+        if not news_file.exists():
+            print(f"News file not found: {news_file}")
+            sys.exit(1)
+        log(f"Using specified file: {news_file}", args.verbose)
+    elif os.getenv("NEWS_FILE"):
+        news_file = Path(os.getenv("NEWS_FILE"))
+        if not news_file.exists():
+            print(f"News file from env not found: {news_file}")
+            sys.exit(1)
+        log(f"Using file from NEWS_FILE env: {news_file}", args.verbose)
     else:
         news_file = find_latest_news_file()
         if not news_file:
