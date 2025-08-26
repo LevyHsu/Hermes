@@ -173,7 +173,7 @@ def load_news(path: Path) -> List[Dict[str, Any]]:
 # Google News RSS
 # ----------------------
 
-def fetch_google_news(company: str, ticker: str, days: int = 30, max_items: int = 10) -> List[Dict[str, Any]]:
+def fetch_google_news(company: str, ticker: str, days: int = 30, max_items: int = 20) -> List[Dict[str, Any]]:
     """Fetch recent news from Google News RSS for a company/ticker."""
     q = f'"{ticker}" OR "{company}" when:{days}d'
     url = (
@@ -218,7 +218,7 @@ def fetch_google_news(company: str, ticker: str, days: int = 30, max_items: int 
 
 
 # ----------------------
-# News providers (non-Yahoo) with unified fallback
+# News providers
 # ----------------------
 
 def _dedup_by_link(items: List[Dict[str, Any]], max_items: int) -> List[Dict[str, Any]]:
@@ -234,220 +234,26 @@ def _dedup_by_link(items: List[Dict[str, Any]], max_items: int) -> List[Dict[str
     return out
 
 
-def fetch_finnhub_company_news(ticker: str, days: int = 30, max_items: int = 20) -> List[Dict[str, Any]]:
-    """Finnhub company news (requires FINNHUB_API_KEY). Docs: https://finnhub.io/docs/api/company-news"""
-    api_key = os.getenv("FINNHUB_API_KEY")
-    if not api_key:
-        return []
-    symbol = ticker.replace(".", "-")
-    to_date = datetime.utcnow().date()
-    from_date = to_date - timedelta(days=days)
-    url = "https://finnhub.io/api/v1/company-news"
-    params = {"symbol": symbol, "from": str(from_date), "to": str(to_date), "token": api_key}
-    try:
-        api_rate_limiter.wait_if_needed()
-        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json() or []
-        items: List[Dict[str, Any]] = []
-        for e in data:
-            title = (e.get("headline") or "").strip()
-            link = (e.get("url") or "").strip()
-            ts = e.get("datetime")  # epoch seconds
-            published = ""
-            if isinstance(ts, (int, float)):
-                try:
-                    published = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-                except Exception:
-                    published = ""
-            if title and link:
-                items.append({
-                    "title": clean_text(title),
-                    "link": clean_text(link),
-                    "published": clean_text(published),
-                    "source": clean_text(e.get("source") or "Finnhub"),
-                })
-        return _dedup_by_link(items, max_items)
-    except Exception as e:
-        log(f"Error fetching Finnhub news for {ticker}: {e}")
-        return []
 
 
-def fetch_polygon_news(ticker: str, max_items: int = 20) -> List[Dict[str, Any]]:
-    """Polygon.io ticker news (requires POLYGON_API_KEY). Docs: https://polygon.io/docs/rest/stocks/news"""
-    api_key = os.getenv("POLYGON_API_KEY")
-    if not api_key:
-        return []
-    symbol = ticker.replace(".", "-")
-    url = "https://api.polygon.io/v2/reference/news"
-    params = {"ticker": symbol, "limit": str(max_items), "apiKey": api_key}
-    try:
-        api_rate_limiter.wait_if_needed()
-        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        results = data.get("results") or []
-        items: List[Dict[str, Any]] = []
-        for e in results:
-            title = (e.get("title") or "").strip()
-            link = (e.get("article_url") or e.get("url") or "").strip()
-            published = (e.get("published_utc") or "").strip()
-            publisher = e.get("publisher") or {}
-            source = publisher.get("name") if isinstance(publisher, dict) else publisher or "Polygon News"
-            if title and link:
-                items.append({
-                    "title": clean_text(title),
-                    "link": clean_text(link),
-                    "published": clean_text(published),
-                    "source": clean_text(source),
-                })
-        return _dedup_by_link(items, max_items)
-    except Exception as e:
-        log(f"Error fetching Polygon news for {ticker}: {e}")
-        return []
 
 
-def fetch_alpha_vantage_news(ticker: str, max_items: int = 20) -> List[Dict[str, Any]]:
-    """Alpha Vantage news & sentiment (requires ALPHAVANTAGE_API_KEY). Docs: https://www.alphavantage.co/documentation/"""
-    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
-    if not api_key:
-        return []
-    symbol = ticker.replace(".", "-")
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": "NEWS_SENTIMENT",
-        "tickers": symbol,
-        "sort": "LATEST",
-        "limit": str(max_items),
-        "apikey": api_key,
-    }
-    try:
-        api_rate_limiter.wait_if_needed()
-        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        feed = data.get("feed") or []
-        items: List[Dict[str, Any]] = []
-        for e in feed:
-            title = (e.get("title") or "").strip()
-            link = (e.get("url") or "").strip()
-            tp = (e.get("time_published") or "").strip()  # e.g., 20250119T141000
-            published = ""
-            if len(tp) >= 8:
-                try:
-                    # Parse as UTC (AlphaVantage timestamps are UTC without TZ)
-                    dt = datetime.strptime(tp[:15], "%Y%m%dT%H%M%S") if len(tp) >= 15 else datetime.strptime(tp[:8], "%Y%m%d")
-                    published = dt.replace(tzinfo=timezone.utc).isoformat()
-                except Exception:
-                    published = tp
-            source = e.get("source") or (e.get("source_domain") or "Alpha Vantage")
-            if title and link:
-                items.append({
-                    "title": clean_text(title),
-                    "link": clean_text(link),
-                    "published": clean_text(published),
-                    "source": clean_text(source),
-                })
-        return _dedup_by_link(items, max_items)
-    except Exception as e:
-        log(f"Error fetching AlphaVantage news for {ticker}: {e}")
-        return []
 
 
-def fetch_gdelt_news(query_text: str, days: int = 30, max_items: int = 20) -> List[Dict[str, Any]]:
-    """GDELT 2.0 Doc API (no key). Docs: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
-    Honors the `days` window via the `timespan` parameter.
-    """
-    url = "https://api.gdeltproject.org/api/v2/doc/doc"
-    params = {
-        "query": query_text,
-        "mode": "ArtList",
-        "maxrecords": str(max_items),
-        "format": "json",
-        "timespan": f"{max(1, int(days))}days",
-        "sort": "DateDesc",
-    }
-    try:
-        api_rate_limiter.wait_if_needed()
-        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-
-        # GDELT sometimes returns HTML error pages instead of JSON
-        ctype = resp.headers.get("content-type", "").lower()
-        if not resp.content or "html" in ctype:
-            return []
-
-        data = resp.json() if resp.content else {}
-        raw = data.get("articles") or data.get("documents") or data.get("result") or []
-        items: List[Dict[str, Any]] = []
-        for e in raw:
-            title = (e.get("title") or e.get("DocumentTitle") or "").strip()
-            link = (e.get("url") or e.get("DocumentIdentifier") or "").strip()
-            published = (e.get("seendate") or e.get("publishedDate") or e.get("Date") or "").strip()
-            if title and link:
-                items.append({
-                    "title": clean_text(title),
-                    "link": clean_text(link),
-                    "published": clean_text(published),
-                    "source": "GDELT",
-                })
-        return _dedup_by_link(items, max_items)
-    except Exception as e:
-        log(f"Error fetching GDELT news: {e}", False)
-        return []
 
 
 def fetch_company_news(ticker: str, company: Optional[str] = None, days: int = 30, max_items: int = 20) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Fetch news from all available providers in parallel.
+    """Fetch news from available providers.
+    Currently returns empty as we only use Google News in the main flow.
     Returns (news_items, source_counts) where source_counts tracks items from each API."""
     
-    source_counts = {
-        "polygon": 0,
-        "finnhub": 0,
-        "alphavantage": 0,
-        "gdelt": 0
-    }
+    source_counts = {}
     
-    all_items = []
-    
-    # Fetch from all sources in parallel (don't stop on success)
-    polygon_items = fetch_polygon_news(ticker, max_items)
-    if polygon_items:
-        all_items.extend(polygon_items)
-        source_counts["polygon"] = len(polygon_items)
-    
-    finnhub_items = fetch_finnhub_company_news(ticker, days, max_items)
-    if finnhub_items:
-        all_items.extend(finnhub_items)
-        source_counts["finnhub"] = len(finnhub_items)
-    
-    alphavantage_items = fetch_alpha_vantage_news(ticker, max_items)
-    if alphavantage_items:
-        all_items.extend(alphavantage_items)
-        source_counts["alphavantage"] = len(alphavantage_items)
-    
-    # Always try GDELT with broader query
-    q = f'"{ticker}"' + (f' OR "{company}"' if company else "")
-    gdelt_items = fetch_gdelt_news(q, days, max_items)
-    if gdelt_items:
-        all_items.extend(gdelt_items)
-        source_counts["gdelt"] = len(gdelt_items)
-    
-    # Deduplicate by link and limit to max_items
-    seen_links = set()
-    deduped = []
-    for item in all_items:
-        link = item.get("link", "")
-        if link and link not in seen_links:
-            seen_links.add(link)
-            deduped.append(item)
-            if len(deduped) >= max_items:
-                break
-    
-    return deduped, source_counts
+    # Return empty - we rely on Google News RSS which is called separately
+    return [], source_counts
 
 # ----------------------
-# Price providers (non-Yahoo) with unified fallback
+# Price data
 # ----------------------
 
 def _price_points_stats(points: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -472,135 +278,13 @@ def _price_points_stats(points: List[Dict[str, Any]]) -> Dict[str, Any]:
     return stats
 
 
-def fetch_polygon_prices(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
-    """Polygon aggregates (requires POLYGON_API_KEY). Docs: https://polygon.io/docs/rest/stocks/aggregates"""
-    api_key = os.getenv("POLYGON_API_KEY")
-    if not api_key:
-        return {}
-    symbol = ticker.replace(".", "-")
-    multiplier = 5 if interval == "5m" else 60
-    timespan = "minute" if interval == "5m" else "minute"
-    to_dt = datetime.utcnow()
-    from_dt = to_dt - timedelta(days=days)
-    url = (
-        f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/"
-        f"{from_dt.strftime('%Y-%m-%d')}/{to_dt.strftime('%Y-%m-%d')}"
-    )
-    params = {"adjusted": "true", "limit": "50000", "apiKey": api_key, "sort": "asc"}
-    try:
-        api_rate_limiter.wait_if_needed()
-        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        results = data.get("results") or []
-        points: List[Dict[str, Any]] = []
-        for r in results:
-            ts_ms = r.get("t")
-            if ts_ms is None:
-                continue
-            ts = int(ts_ms) / 1000.0
-            points.append({
-                "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-                "open": r.get("o"),
-                "high": r.get("h"),
-                "low": r.get("l"),
-                "close": r.get("c"),
-                "volume": r.get("v"),
-            })
-        stats = _price_points_stats(points)
-        return {"symbol": symbol, "interval": interval, "stats": stats, "points": points[-100:]}
-    except Exception as e:
-        log(f"Error fetching Polygon prices for {ticker}: {e}")
-        return {}
-
-
-def fetch_finnhub_prices(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
-    """Finnhub stock candles (requires FINNHUB_API_KEY). Docs: https://finnhub.io/docs/api/stock-candles"""
-    api_key = os.getenv("FINNHUB_API_KEY")
-    if not api_key:
-        return {}
-    symbol = ticker.replace(".", "-")
-    resolution = "5" if interval == "5m" else "60"
-    to_ts = int(datetime.utcnow().timestamp())
-    from_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
-    url = "https://finnhub.io/api/v1/stock/candle"
-    params = {"symbol": symbol, "resolution": resolution, "from": from_ts, "to": to_ts, "token": api_key}
-    try:
-        api_rate_limiter.wait_if_needed()
-        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        if data.get("s") != "ok":
-            return {}
-        t = data.get("t") or []
-        o = data.get("o") or []
-        h = data.get("h") or []
-        l = data.get("l") or []
-        c = data.get("c") or []
-        v = data.get("v") or []
-        points: List[Dict[str, Any]] = []
-        for i in range(min(len(t), len(c))):
-            ts = t[i]
-            points.append({
-                "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-                "open": o[i] if i < len(o) else None,
-                "high": h[i] if i < len(h) else None,
-                "low": l[i] if i < len(l) else None,
-                "close": c[i] if i < len(c) else None,
-                "volume": v[i] if i < len(v) else None,
-            })
-        stats = _price_points_stats(points)
-        return {"symbol": symbol, "interval": interval, "stats": stats, "points": points[-100:]}
-    except Exception as e:
-        log(f"Error fetching Finnhub prices for {ticker}: {e}")
-        return {}
 
 
 
-def fetch_alpha_vantage_intraday(ticker: str, interval: str = "5min") -> Dict[str, Any]:
-    """Alpha Vantage intraday (requires ALPHAVANTAGE_API_KEY). Docs: https://www.alphavantage.co/documentation/"""
-    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
-    if not api_key:
-        return {}
-    symbol = ticker.replace(".", "-")
-    url = "https://www.alphavantage.co/query"
-    params = {"function": "TIME_SERIES_INTRADAY", "symbol": symbol, "interval": interval, "outputsize": "compact", "apikey": api_key}
-    try:
-        api_rate_limiter.wait_if_needed()
-        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        key = f"Time Series ({interval})"
-        series = data.get(key) or {}
-        if not series:
-            return {}
-        # AlphaVantage timestamps are in local US/Eastern without TZ; treat as UTC for simplicity
-        rows = []
-        for ts_str, row in series.items():
-            try:
-                # Attempt parse as naive and set UTC
-                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
-            rows.append((dt, row))
-        rows.sort(key=lambda x: x[0])
-        points = []
-        for dt, row in rows:
-            points.append({
-                "timestamp": dt.isoformat(),
-                "open": float(row.get("1. open")) if row.get("1. open") is not None else None,
-                "high": float(row.get("2. high")) if row.get("2. high") is not None else None,
-                "low": float(row.get("3. low")) if row.get("3. low") is not None else None,
-                "close": float(row.get("4. close")) if row.get("4. close") is not None else None,
-                "volume": float(row.get("5. volume")) if row.get("5. volume") is not None else None,
-            })
-        stats = _price_points_stats(points)
-        return {"symbol": symbol, "interval": interval, "stats": stats, "points": points[-100:]}
-    except Exception as e:
-        log(f"Error fetching AlphaVantage prices for {ticker}: {e}")
-        return {}
 
-# --- Yahoo Finance fallback (no API key) ---
+
+
+# --- Yahoo Finance price data (no API key) ---
 
 def fetch_yahoo_chart_prices(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
     """Fallback intraday prices via Yahoo Finance v8 chart endpoint (no API key).
@@ -674,29 +358,10 @@ def fetch_yahoo_chart_prices(ticker: str, days: int = 7, interval: str = "5m") -
 
 
 def fetch_price_data(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
-    """Unified price fetch with provider fallback.
-    Order: Polygon -> Finnhub -> AlphaVantage -> Yahoo (no key).
+    """Fetch price data using Yahoo Finance (no API key required).
     Returns a dict with keys: symbol, interval, stats, points, and provider.
     """
-    # Try Polygon intraday
-    data = fetch_polygon_prices(ticker, days, interval)
-    if data:
-        data.setdefault("provider", "polygon")
-        return data
-
-    # Try Finnhub intraday
-    data = fetch_finnhub_prices(ticker, days, interval)
-    if data:
-        data.setdefault("provider", "finnhub")
-        return data
-
-    # Try AlphaVantage intraday
-    data = fetch_alpha_vantage_intraday(ticker, interval="5min")
-    if data:
-        data.setdefault("provider", "alphavantage")
-        return data
-
-    # Final fallback: Yahoo chart API (no API key required)
+    # Use Yahoo chart API (no API key required)
     data = fetch_yahoo_chart_prices(ticker, days, interval)
     if data:
         data.setdefault("provider", "yahoo")
@@ -1087,24 +752,21 @@ def process_news_item(client: LMStudioClient, news_item: Dict[str, Any], listing
         if confidence >= confidence_threshold:
             log(f"  Phase 2: Enriching {ticker} (confidence: {confidence}%)...", verbose)
             
-            # Fetch additional data - Google News + all alternative sources
+            # Fetch additional data - Google News only
             company_name = decision.get("company_name", ticker)
             google_news = fetch_google_news(company_name, ticker, news_days)
-            alt_news, alt_news_sources = fetch_company_news(ticker, company_name, news_days)
             price_data = fetch_price_data(ticker, price_days, interval="5m")
             
-            # Combine all news sources
-            all_news_sources = {"google": len(google_news), **alt_news_sources}
-            total_news = len(google_news) + len(alt_news)
+            # News sources summary
+            all_news_sources = {"google": len(google_news)}
+            total_news = len(google_news)
             
             log(f"    Fetched {total_news} total news items", verbose)
             if verbose:
-                sources_str = ", ".join([f"{k}:{v}" for k, v in all_news_sources.items() if v > 0])
-                log(f"    News sources: {sources_str}")
+                log(f"    News source: Google News: {len(google_news)} items")
             
-            # Refine decision with all news combined
-            all_news_items = google_news + alt_news
-            refined = refine_decision(client, news_item, decision, all_news_items, all_news_sources, price_data)
+            # Refine decision with Google News
+            refined = refine_decision(client, news_item, decision, google_news, all_news_sources, price_data)
             
             # Add enrichment data to result with detailed counts
             refined["news_sources"] = all_news_sources
