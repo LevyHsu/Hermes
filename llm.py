@@ -389,8 +389,8 @@ def fetch_gdelt_news(query_text: str, days: int = 30, max_items: int = 20) -> Li
 
 
 def fetch_company_news(ticker: str, company: Optional[str] = None, days: int = 30, max_items: int = 20) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Unified news fetch with provider fallback (Polygon -> Finnhub -> AlphaVantage -> GDELT).
-    Returns (news_items, source_counts) where source_counts tracks which API was used."""
+    """Fetch news from all available providers in parallel.
+    Returns (news_items, source_counts) where source_counts tracks items from each API."""
     
     source_counts = {
         "polygon": 0,
@@ -399,29 +399,43 @@ def fetch_company_news(ticker: str, company: Optional[str] = None, days: int = 3
         "gdelt": 0
     }
     
-    # Try Polygon
-    items = fetch_polygon_news(ticker, max_items)
-    if items:
-        source_counts["polygon"] = len(items)
-        return items, source_counts
+    all_items = []
     
-    # Try Finnhub
-    items = fetch_finnhub_company_news(ticker, days, max_items)
-    if items:
-        source_counts["finnhub"] = len(items)
-        return items, source_counts
+    # Fetch from all sources in parallel (don't stop on success)
+    polygon_items = fetch_polygon_news(ticker, max_items)
+    if polygon_items:
+        all_items.extend(polygon_items)
+        source_counts["polygon"] = len(polygon_items)
     
-    # Try Alpha Vantage
-    items = fetch_alpha_vantage_news(ticker, max_items)
-    if items:
-        source_counts["alphavantage"] = len(items)
-        return items, source_counts
+    finnhub_items = fetch_finnhub_company_news(ticker, days, max_items)
+    if finnhub_items:
+        all_items.extend(finnhub_items)
+        source_counts["finnhub"] = len(finnhub_items)
     
-    # Fallback to GDELT using a broader company/ticker query
+    alphavantage_items = fetch_alpha_vantage_news(ticker, max_items)
+    if alphavantage_items:
+        all_items.extend(alphavantage_items)
+        source_counts["alphavantage"] = len(alphavantage_items)
+    
+    # Always try GDELT with broader query
     q = f'"{ticker}"' + (f' OR "{company}"' if company else "")
-    items = fetch_gdelt_news(q, days, max_items)
-    source_counts["gdelt"] = len(items)
-    return items, source_counts
+    gdelt_items = fetch_gdelt_news(q, days, max_items)
+    if gdelt_items:
+        all_items.extend(gdelt_items)
+        source_counts["gdelt"] = len(gdelt_items)
+    
+    # Deduplicate by link and limit to max_items
+    seen_links = set()
+    deduped = []
+    for item in all_items:
+        link = item.get("link", "")
+        if link and link not in seen_links:
+            seen_links.add(link)
+            deduped.append(item)
+            if len(deduped) >= max_items:
+                break
+    
+    return deduped, source_counts
 
 # ----------------------
 # Price providers (non-Yahoo) with unified fallback
@@ -867,26 +881,16 @@ def build_refine_schema() -> Dict[str, Any]:
     }
 
 def refine_decision(client: LMStudioClient, news_item: Dict[str, Any], decision: Dict[str, Any],
-                    google_news: List[Dict[str, Any]], alt_news: List[Dict[str, Any]], 
+                    all_news: List[Dict[str, Any]], news_sources: Dict[str, int], 
                     price_data: Dict[str, Any]) -> Dict[str, Any]:
     """Refine a high-confidence decision with additional data."""
     
-    # Combine all available news sources
+    # Prepare recent news for context (limit to top 15 items)
     all_recent_news = []
-    
-    # Add Google News items
-    for item in google_news[:7]:
+    for item in all_news[:15]:
         all_recent_news.append({
             "title": item["title"],
-            "source": item.get("source", "Google News"),
-            "published": item.get("published", ""),
-        })
-    
-    # Add alternative news items (Polygon, Finnhub, AlphaVantage, GDELT, etc.)
-    for item in alt_news[:7]:
-        all_recent_news.append({
-            "title": item["title"],
-            "source": item.get("source", "Alternative News"),
+            "source": item.get("source", "Unknown"),
             "published": item.get("published", ""),
         })
     
@@ -986,26 +990,28 @@ def process_news_item(client: LMStudioClient, news_item: Dict[str, Any], listing
         if confidence >= confidence_threshold:
             log(f"  Phase 2: Enriching {ticker} (confidence: {confidence}%)...", verbose)
             
-            # Fetch additional data
+            # Fetch additional data - Google News + all alternative sources
             company_name = decision.get("company_name", ticker)
             google_news = fetch_google_news(company_name, ticker, news_days)
             alt_news, alt_news_sources = fetch_company_news(ticker, company_name, news_days)
             price_data = fetch_price_data(ticker, price_days, interval="5m")
             
-            log(f"    Fetched {len(google_news)} Google news, {len(alt_news)} alt news items", verbose)
-            if verbose and alt_news:
-                source_used = [k for k, v in alt_news_sources.items() if v > 0]
-                log(f"    Alt news source: {source_used[0] if source_used else 'none'}")
+            # Combine all news sources
+            all_news_sources = {"google": len(google_news), **alt_news_sources}
+            total_news = len(google_news) + len(alt_news)
             
-            # Refine decision
-            refined = refine_decision(client, news_item, decision, google_news, alt_news, price_data)
+            log(f"    Fetched {total_news} total news items", verbose)
+            if verbose:
+                sources_str = ", ".join([f"{k}:{v}" for k, v in all_news_sources.items() if v > 0])
+                log(f"    News sources: {sources_str}")
+            
+            # Refine decision with all news combined
+            all_news_items = google_news + alt_news
+            refined = refine_decision(client, news_item, decision, all_news_items, all_news_sources, price_data)
             
             # Add enrichment data to result with detailed counts
-            refined["news_sources"] = {
-                "google": len(google_news),
-                **alt_news_sources
-            }
-            refined["total_news_count"] = len(google_news) + len(alt_news)
+            refined["news_sources"] = all_news_sources
+            refined["total_news_count"] = total_news
             refined["has_price_data"] = bool(price_data)
             
             if verbose and "revised_confidence" in refined:
