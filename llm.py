@@ -2,115 +2,107 @@
 # -*- coding: utf-8 -*-
 
 """
-llm.py — Decision engine that reads the latest minute-bucketed news JSON,
-consults the latest US stock listings, and asks a local LLM (LM Studio)
-for up to 0–10 related tickers with BUY/SELL decisions + confidence.
-
-Requirements / assumptions
-- LM Studio server API is running (e.g., localhost:1234 or 192.168.0.198:1234) and a model
-  is loaded/selected in the LM Studio UI.
-- The news harvester stores files at ./data/news/YYMMDDHHMM.json (array of items, with
-  mandatory fields including "id", "title", "link", and "article-body").
-- Listings are in ./data/us-stock-listing/us-listings-latest.json (or the dated one).
-- This script runs continuously until interrupted (Ctrl+C / SIGTERM):
-    1) Locate the most recent news minute file
-    2) For each unseen news item, query the model
-    3) Save per-item decisions to ./data/llm/<minute>/<news_id>.json
-    4) Save per-minute aggregate to ./data/llm/<minute>/<minute>.json
-
-CLI options:
-  --server-host host:port (default: localhost:1234)
-  --poll-interval seconds (default 10)
-  --verbose
-
-Notes on MCP:
-  LM Studio can host MCP servers (e.g., a RAG server) in the app itself; when the
-  server is connected, tool use happens inside LM Studio.
+llm2.py - Enhanced LLM decision engine with two-phase analysis:
+1. Initial analysis: Find up to 10 related stocks with buy/sell confidence
+2. Enrichment: For high-confidence stocks, fetch additional data and refine
 """
 
 import argparse
 import json
+import csv
 import os
 import re
-import signal
-import sqlite3
 import sys
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import feedparser
-
-# lmstudio-python SDK (native)
-# Docs: https://lmstudio.ai/docs/python/getting-started/project-setup
-#       https://lmstudio.ai/docs/python/llm-prediction/structured-response
 import lmstudio as lms
 
+# Directories
 DATA_DIR = Path("./data")
 NEWS_DIR = DATA_DIR / "news"
-LLM_OUT_DIR = DATA_DIR / "llm"
+RESULT_DIR = DATA_DIR / "result"
 LISTING_DIR = DATA_DIR / "us-stock-listing"
-DECISIONS_DB = LLM_OUT_DIR / ".decisions.db"
-# Store per-news processed JSON under data/llm/<YYMMDDHHMM>/<news_id>.json
-PROCESSED_DIR = LLM_OUT_DIR
 
-DEFAULT_SERVER_HOST = os.environ.get("LMSTUDIO_SERVER_HOST", "192.168.0.198:1234")
+# User Agent for HTTP requests
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    )
+}
+HTTP_TIMEOUT = (8, 15)
+
+# Simple rate limiter for external APIs
+class SimpleRateLimiter:
+    """Simple rate limiter without backoff."""
+    def __init__(self, min_interval: float = 1.0):
+        self.min_interval = min_interval
+        self.last_call = 0
+    
+    def wait_if_needed(self):
+        """Wait if necessary to respect rate limit."""
+        now = time.time()
+        elapsed = now - self.last_call
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self.last_call = time.time()
+
+# Global rate limiter for external APIs
+api_rate_limiter = SimpleRateLimiter(min_interval=1.0)
 
 # ----------------------
-# Server host normalization
-# ----------------------
-_HOST_RE = re.compile(r"^(?:https?://)?([^/]+?)(?:/.*)?$")
-def normalize_server_host(host: str) -> str:
-    if not host:
-        return "localhost:1234"
-    m = _HOST_RE.match(host.strip())
-    if not m:
-        return host
-    return m.group(1)
-
-# ----------------------
-# Small utilities
+# Utilities
 # ----------------------
 
-def log(msg: str, verbose: bool):
+def log(msg: str, verbose: bool = True):
+    """Log message with timestamp."""
     if verbose:
         now = datetime.now().strftime("%H:%M:%S")
         print(f"[{now}] {msg}", file=sys.stderr)
 
 def ensure_dirs():
-    LLM_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    NEWS_DIR.mkdir(parents=True, exist_ok=True)
+    """Create necessary directories."""
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+def normalize_server_host(host: str) -> str:
+    """Extract host:port from various URL formats."""
+    if not host:
+        return "localhost:1234"
+    # Remove protocol and path if present
+    host = re.sub(r"^https?://", "", host)
+    host = re.sub(r"/.*$", "", host)
+    return host
 
 # ----------------------
-# SQLite for dedupe
+# Text cleaning
 # ----------------------
 
-def decisions_db_init() -> sqlite3.Connection:
-    ensure_dirs()
-    con = sqlite3.connect(DECISIONS_DB)
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS processed (news_id TEXT PRIMARY KEY, minute TEXT NOT NULL, created_utc TEXT NOT NULL)"
-    )
-    con.commit()
-    return con
+INVISIBLE_CATEGORIES = {"Cf", "Cc", "Cs"}
 
-def already_processed(con: sqlite3.Connection, news_id: str) -> bool:
-    cur = con.execute("SELECT 1 FROM processed WHERE news_id=?", (news_id,))
-    return cur.fetchone() is not None
+def clean_text(s: Any) -> Any:
+    """Clean text by normalizing unicode and removing invisible characters."""
+    if not isinstance(s, str):
+        return s
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in INVISIBLE_CATEGORIES)
+    return s.strip()
 
-def mark_processed(con: sqlite3.Connection, news_id: str, minute: str):
-    with con:
-        con.execute(
-            "INSERT OR IGNORE INTO processed(news_id, minute, created_utc) VALUES (?, ?, ?)",
-            (news_id, minute, datetime.now(timezone.utc).isoformat(timespec="seconds")),
-        )
+def truncate_with_ellipsis(text: str, max_length: int = 240) -> str:
+    """Truncate text to max length with ellipsis."""
+    if not text or len(text) <= max_length:
+        return text
+    return text[:max_length-3] + "..."
 
 # ----------------------
-# Listings loader + tools
+# Stock Listings
 # ----------------------
 
 @dataclass
@@ -124,21 +116,19 @@ class ListingItem:
     cik: Optional[str]
 
 def load_listings() -> Dict[str, ListingItem]:
-    """Load latest listings (prefer us-listings-short-latest.json if present)."""
-    short_latest = LISTING_DIR / "us-listings-short-latest.json"
-    full_latest = LISTING_DIR / "us-listings-latest.json"
-    path = short_latest if short_latest.exists() else full_latest
+    """Load US stock listings from JSON."""
+    path = LISTING_DIR / "us-listings-latest.json"
     if not path.exists():
-        # Fall back to latest dated file
+        # Try dated files
         dated = sorted(LISTING_DIR.glob("us-listings-*.json"))
         if not dated:
-            raise FileNotFoundError("No listings JSON found in ./data/us-stock-listing")
+            raise FileNotFoundError(f"No listings found in {LISTING_DIR}")
         path = dated[-1]
-
+    
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-
-    mapping: Dict[str, ListingItem] = {}
+    
+    mapping = {}
     for rec in data:
         ticker = (rec.get("ticker") or "").upper()
         if not ticker:
@@ -155,37 +145,13 @@ def load_listings() -> Dict[str, ListingItem]:
         )
     return mapping
 
-def find_by_name_partial(listings: Dict[str, ListingItem], query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    q = query.lower()
-    out: List[Tuple[str, float]] = []
-    for tkr, item in listings.items():
-        nm = (item.name or "").lower()
-        if not nm:
-            continue
-        if q in nm:
-            score = 1.0 - (nm.find(q) / max(1, len(nm)))
-            out.append((tkr, score))
-    out.sort(key=lambda x: x[1], reverse=True)
-    results: List[Dict[str, Any]] = []
-    for tkr, _s in out[:limit]:
-        it = listings[tkr]
-        results.append({
-            "ticker": it.ticker,
-            "name": it.name,
-            "exchange": it.exchange,
-            "type": it.type,
-            "is_etf": it.is_etf,
-            "is_adr": it.is_adr,
-        })
-    return results
-
 # ----------------------
-# News loader
+# News handling
 # ----------------------
 
-def latest_news_file() -> Optional[Path]:
-    # Accept files named YYMMDDHHMM.json (10 digits in the stem)
-    files: List[Path] = []
+def find_latest_news_file() -> Optional[Path]:
+    """Find the most recent news file (YYMMDDHHMM.json)."""
+    files = []
     for p in NEWS_DIR.glob("*.json"):
         stem = p.stem
         if len(stem) == 10 and stem.isdigit():
@@ -196,6 +162,7 @@ def latest_news_file() -> Optional[Path]:
     return files[-1]
 
 def load_news(path: Path) -> List[Dict[str, Any]]:
+    """Load news items from JSON file."""
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
@@ -203,48 +170,520 @@ def load_news(path: Path) -> List[Dict[str, Any]]:
     return data
 
 # ----------------------
-# Prompt + schema
+# Google News RSS
 # ----------------------
 
-SYSTEM_TEMPLATE = (
-    "You are a trading assistant. Given one news article about US markets and the US "
-    "listings universe, select up to 10 US-listed tickers most directly affected. "
-    "For each, output an action and a confidence index (0-100).\n\n"
-    "Rules:\n"
-    "- Consider first-order impact (issuer mentioned, direct competitors, suppliers, ETFs).\n"
-    "- If impact is ambiguous, generic personal finance content, opinion/column with no issuer impact, or otherwise immaterial, return ZERO decisions.\n"
-    "- Only include tickers that are listed in the provided US listings (you can call tools to check).\n"
-    "- BUY means open/accumulate long; SELL means reduce/close long (or short).\n"
-    "- Confidence 100 = act now; 0 = not sure.\n"
-    "- Each decision MUST include a short non-empty reason (<= 240 chars).\n"
-    "- Output JSON ONLY matching the response schema. No commentary."
-)
+def fetch_google_news(company: str, ticker: str, days: int = 30, max_items: int = 10) -> List[Dict[str, Any]]:
+    """Fetch recent news from Google News RSS for a company/ticker."""
+    q = f'"{ticker}" OR "{company}" when:{days}d'
+    url = (
+        "https://news.google.com/rss/search?"
+        f"q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
+    )
+    
+    try:
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        fp = feedparser.parse(resp.content)
+        
+        items = []
+        for entry in fp.entries[:max_items * 2]:  # Oversample for deduplication
+            title = entry.get("title", "").strip()
+            link = entry.get("link", "").strip()
+            published = entry.get("published", "") or entry.get("updated", "")
+            source = ""
+            if "source" in entry and isinstance(entry.source, dict):
+                source = entry.source.get("title", "")
+            
+            if title and link:
+                items.append({
+                    "title": clean_text(title),
+                    "link": clean_text(link),
+                    "published": clean_text(published),
+                    "source": clean_text(source),
+                })
+        
+        # Deduplicate by link
+        seen = set()
+        deduped = []
+        for item in items:
+            if item["link"] not in seen:
+                seen.add(item["link"])
+                deduped.append(item)
+        
+        return deduped[:max_items]
+    except Exception as e:
+        log(f"Error fetching Google News for {ticker}: {e}")
+        return []
 
-RESPONSE_SCHEMA_EXAMPLE = {
-    "news_id": "<string>",
-    "news_title": "<string>",
-    "link": "<url>",
-    "relevance": "none",  # one of: none, low, medium, high
-    "relevance_reason": "<short reason>",
-    "decisions": [
-        {
-            "ticker": "AAPL",
-            "action": "BUY",
-            "confidence": 87,
-            "reason": "iPhone demand surprise; revenue guide beat; peers lift."
-        }
-    ]
-}
 
-def build_response_schema() -> Dict[str, Any]:
+# ----------------------
+# News providers (non-Yahoo) with unified fallback
+# ----------------------
+
+def _dedup_by_link(items: List[Dict[str, Any]], max_items: int) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for it in items:
+        lk = it.get("link", "")
+        if lk and lk not in seen:
+            seen.add(lk)
+            out.append(it)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def fetch_finnhub_company_news(ticker: str, days: int = 30, max_items: int = 20) -> List[Dict[str, Any]]:
+    """Finnhub company news (requires FINNHUB_API_KEY). Docs: https://finnhub.io/docs/api/company-news"""
+    api_key = os.getenv("FINNHUB_API_KEY")
+    if not api_key:
+        return []
+    symbol = ticker.replace(".", "-")
+    to_date = datetime.utcnow().date()
+    from_date = to_date - timedelta(days=days)
+    url = "https://finnhub.io/api/v1/company-news"
+    params = {"symbol": symbol, "from": str(from_date), "to": str(to_date), "token": api_key}
+    try:
+        api_rate_limiter.wait_if_needed()
+        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json() or []
+        items: List[Dict[str, Any]] = []
+        for e in data:
+            title = (e.get("headline") or "").strip()
+            link = (e.get("url") or "").strip()
+            ts = e.get("datetime")  # epoch seconds
+            published = ""
+            if isinstance(ts, (int, float)):
+                try:
+                    published = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                except Exception:
+                    published = ""
+            if title and link:
+                items.append({
+                    "title": clean_text(title),
+                    "link": clean_text(link),
+                    "published": clean_text(published),
+                    "source": clean_text(e.get("source") or "Finnhub"),
+                })
+        return _dedup_by_link(items, max_items)
+    except Exception as e:
+        log(f"Error fetching Finnhub news for {ticker}: {e}")
+        return []
+
+
+def fetch_polygon_news(ticker: str, max_items: int = 20) -> List[Dict[str, Any]]:
+    """Polygon.io ticker news (requires POLYGON_API_KEY). Docs: https://polygon.io/docs/rest/stocks/news"""
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        return []
+    symbol = ticker.replace(".", "-")
+    url = "https://api.polygon.io/v2/reference/news"
+    params = {"ticker": symbol, "limit": str(max_items), "apiKey": api_key}
+    try:
+        api_rate_limiter.wait_if_needed()
+        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        results = data.get("results") or []
+        items: List[Dict[str, Any]] = []
+        for e in results:
+            title = (e.get("title") or "").strip()
+            link = (e.get("article_url") or e.get("url") or "").strip()
+            published = (e.get("published_utc") or "").strip()
+            publisher = e.get("publisher") or {}
+            source = publisher.get("name") if isinstance(publisher, dict) else publisher or "Polygon News"
+            if title and link:
+                items.append({
+                    "title": clean_text(title),
+                    "link": clean_text(link),
+                    "published": clean_text(published),
+                    "source": clean_text(source),
+                })
+        return _dedup_by_link(items, max_items)
+    except Exception as e:
+        log(f"Error fetching Polygon news for {ticker}: {e}")
+        return []
+
+
+def fetch_alpha_vantage_news(ticker: str, max_items: int = 20) -> List[Dict[str, Any]]:
+    """Alpha Vantage news & sentiment (requires ALPHAVANTAGE_API_KEY). Docs: https://www.alphavantage.co/documentation/"""
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not api_key:
+        return []
+    symbol = ticker.replace(".", "-")
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "NEWS_SENTIMENT",
+        "tickers": symbol,
+        "sort": "LATEST",
+        "limit": str(max_items),
+        "apikey": api_key,
+    }
+    try:
+        api_rate_limiter.wait_if_needed()
+        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        feed = data.get("feed") or []
+        items: List[Dict[str, Any]] = []
+        for e in feed:
+            title = (e.get("title") or "").strip()
+            link = (e.get("url") or "").strip()
+            tp = (e.get("time_published") or "").strip()  # e.g., 20250119T141000
+            published = ""
+            if len(tp) >= 8:
+                try:
+                    # Parse as UTC (AlphaVantage timestamps are UTC without TZ)
+                    dt = datetime.strptime(tp[:15], "%Y%m%dT%H%M%S") if len(tp) >= 15 else datetime.strptime(tp[:8], "%Y%m%d")
+                    published = dt.replace(tzinfo=timezone.utc).isoformat()
+                except Exception:
+                    published = tp
+            source = e.get("source") or (e.get("source_domain") or "Alpha Vantage")
+            if title and link:
+                items.append({
+                    "title": clean_text(title),
+                    "link": clean_text(link),
+                    "published": clean_text(published),
+                    "source": clean_text(source),
+                })
+        return _dedup_by_link(items, max_items)
+    except Exception as e:
+        log(f"Error fetching AlphaVantage news for {ticker}: {e}")
+        return []
+
+
+def fetch_gdelt_news(query_text: str, days: int = 30, max_items: int = 20) -> List[Dict[str, Any]]:
+    """GDELT 2.0 Doc API (no key). Docs: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/"""
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {"query": query_text, "mode": "ArtList", "maxrecords": str(max_items), "format": "json"}
+    try:
+        api_rate_limiter.wait_if_needed()
+        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        
+        # GDELT sometimes returns HTML error pages instead of JSON
+        if not resp.content or 'html' in resp.headers.get('content-type', '').lower():
+            return []
+            
+        data = resp.json() if resp.content else {}
+        # The JSON can expose different field names across modes; handle robustly
+        raw = data.get("articles") or data.get("documents") or data.get("result") or []
+        items: List[Dict[str, Any]] = []
+        for e in raw:
+            title = (e.get("title") or e.get("DocumentTitle") or "").strip()
+            link = (e.get("url") or e.get("DocumentIdentifier") or "").strip()
+            published = (e.get("seendate") or e.get("publishedDate") or e.get("Date") or "").strip()
+            if title and link:
+                items.append({
+                    "title": clean_text(title),
+                    "link": clean_text(link),
+                    "published": clean_text(published),
+                    "source": "GDELT",
+                })
+        return _dedup_by_link(items, max_items)
+    except Exception as e:
+        log(f"Error fetching GDELT news: {e}")
+        return []
+
+
+def fetch_company_news(ticker: str, company: Optional[str] = None, days: int = 30, max_items: int = 20) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Unified news fetch with provider fallback (Polygon -> Finnhub -> AlphaVantage -> GDELT).
+    Returns (news_items, source_counts) where source_counts tracks which API was used."""
+    
+    source_counts = {
+        "polygon": 0,
+        "finnhub": 0,
+        "alphavantage": 0,
+        "gdelt": 0
+    }
+    
+    # Try Polygon
+    items = fetch_polygon_news(ticker, max_items)
+    if items:
+        source_counts["polygon"] = len(items)
+        return items, source_counts
+    
+    # Try Finnhub
+    items = fetch_finnhub_company_news(ticker, days, max_items)
+    if items:
+        source_counts["finnhub"] = len(items)
+        return items, source_counts
+    
+    # Try Alpha Vantage
+    items = fetch_alpha_vantage_news(ticker, max_items)
+    if items:
+        source_counts["alphavantage"] = len(items)
+        return items, source_counts
+    
+    # Fallback to GDELT using a broader company/ticker query
+    q = f'"{ticker}"' + (f' OR "{company}"' if company else "")
+    items = fetch_gdelt_news(q, days, max_items)
+    source_counts["gdelt"] = len(items)
+    return items, source_counts
+
+# ----------------------
+# Price providers (non-Yahoo) with unified fallback
+# ----------------------
+
+def _price_points_stats(points: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not points:
+        return {}
+    closes_valid = [p["close"] for p in points if p.get("close") is not None]
+    highs_valid = [p["high"] for p in points if p.get("high") is not None]
+    lows_valid = [p["low"] for p in points if p.get("low") is not None]
+    stats = {
+        "current": closes_valid[-1] if closes_valid else None,
+        "previous_close": closes_valid[-2] if len(closes_valid) >= 2 else None,
+        "period_high": max(highs_valid) if highs_valid else None,
+        "period_low": min(lows_valid) if lows_valid else None,
+        "period_first": closes_valid[0] if closes_valid else None,
+        "period_last": closes_valid[-1] if closes_valid else None,
+    }
+    if stats["period_first"] is not None and stats["period_last"] is not None:
+        change = stats["period_last"] - stats["period_first"]
+        pct_change = (change / stats["period_first"]) * 100 if stats["period_first"] else None
+        stats["change"] = round(change, 4)
+        stats["pct_change"] = round(pct_change, 2) if pct_change is not None else None
+    return stats
+
+
+def fetch_polygon_prices(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
+    """Polygon aggregates (requires POLYGON_API_KEY). Docs: https://polygon.io/docs/rest/stocks/aggregates"""
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        return {}
+    symbol = ticker.replace(".", "-")
+    multiplier = 5 if interval == "5m" else 60
+    timespan = "minute" if interval == "5m" else "minute"
+    to_dt = datetime.utcnow()
+    from_dt = to_dt - timedelta(days=days)
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/"
+        f"{from_dt.strftime('%Y-%m-%d')}/{to_dt.strftime('%Y-%m-%d')}"
+    )
+    params = {"adjusted": "true", "limit": "50000", "apiKey": api_key, "sort": "asc"}
+    try:
+        api_rate_limiter.wait_if_needed()
+        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        results = data.get("results") or []
+        points: List[Dict[str, Any]] = []
+        for r in results:
+            ts_ms = r.get("t")
+            if ts_ms is None:
+                continue
+            ts = int(ts_ms) / 1000.0
+            points.append({
+                "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                "open": r.get("o"),
+                "high": r.get("h"),
+                "low": r.get("l"),
+                "close": r.get("c"),
+                "volume": r.get("v"),
+            })
+        stats = _price_points_stats(points)
+        return {"symbol": symbol, "interval": interval, "stats": stats, "points": points[-100:]}
+    except Exception as e:
+        log(f"Error fetching Polygon prices for {ticker}: {e}")
+        return {}
+
+
+def fetch_finnhub_prices(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
+    """Finnhub stock candles (requires FINNHUB_API_KEY). Docs: https://finnhub.io/docs/api/stock-candles"""
+    api_key = os.getenv("FINNHUB_API_KEY")
+    if not api_key:
+        return {}
+    symbol = ticker.replace(".", "-")
+    resolution = "5" if interval == "5m" else "60"
+    to_ts = int(datetime.utcnow().timestamp())
+    from_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+    url = "https://finnhub.io/api/v1/stock/candle"
+    params = {"symbol": symbol, "resolution": resolution, "from": from_ts, "to": to_ts, "token": api_key}
+    try:
+        api_rate_limiter.wait_if_needed()
+        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        if data.get("s") != "ok":
+            return {}
+        t = data.get("t") or []
+        o = data.get("o") or []
+        h = data.get("h") or []
+        l = data.get("l") or []
+        c = data.get("c") or []
+        v = data.get("v") or []
+        points: List[Dict[str, Any]] = []
+        for i in range(min(len(t), len(c))):
+            ts = t[i]
+            points.append({
+                "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                "open": o[i] if i < len(o) else None,
+                "high": h[i] if i < len(h) else None,
+                "low": l[i] if i < len(l) else None,
+                "close": c[i] if i < len(c) else None,
+                "volume": v[i] if i < len(v) else None,
+            })
+        stats = _price_points_stats(points)
+        return {"symbol": symbol, "interval": interval, "stats": stats, "points": points[-100:]}
+    except Exception as e:
+        log(f"Error fetching Finnhub prices for {ticker}: {e}")
+        return {}
+
+
+def fetch_alpha_vantage_intraday(ticker: str, interval: str = "5min") -> Dict[str, Any]:
+    """Alpha Vantage intraday (requires ALPHAVANTAGE_API_KEY). Docs: https://www.alphavantage.co/documentation/"""
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not api_key:
+        return {}
+    symbol = ticker.replace(".", "-")
+    url = "https://www.alphavantage.co/query"
+    params = {"function": "TIME_SERIES_INTRADAY", "symbol": symbol, "interval": interval, "outputsize": "compact", "apikey": api_key}
+    try:
+        api_rate_limiter.wait_if_needed()
+        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        key = f"Time Series ({interval})"
+        series = data.get(key) or {}
+        if not series:
+            return {}
+        # AlphaVantage timestamps are in local US/Eastern without TZ; treat as UTC for simplicity
+        rows = []
+        for ts_str, row in series.items():
+            try:
+                # Attempt parse as naive and set UTC
+                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            rows.append((dt, row))
+        rows.sort(key=lambda x: x[0])
+        points = []
+        for dt, row in rows:
+            points.append({
+                "timestamp": dt.isoformat(),
+                "open": float(row.get("1. open")) if row.get("1. open") is not None else None,
+                "high": float(row.get("2. high")) if row.get("2. high") is not None else None,
+                "low": float(row.get("3. low")) if row.get("3. low") is not None else None,
+                "close": float(row.get("4. close")) if row.get("4. close") is not None else None,
+                "volume": float(row.get("5. volume")) if row.get("5. volume") is not None else None,
+            })
+        stats = _price_points_stats(points)
+        return {"symbol": symbol, "interval": interval, "stats": stats, "points": points[-100:]}
+    except Exception as e:
+        log(f"Error fetching AlphaVantage prices for {ticker}: {e}")
+        return {}
+
+
+def fetch_price_data(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
+    """Unified price fetch with provider fallback (Polygon -> Finnhub -> AlphaVantage)."""
+    # Try Polygon intraday
+    data = fetch_polygon_prices(ticker, days, interval)
+    if data:
+        return data
+    # Try Finnhub intraday
+    data = fetch_finnhub_prices(ticker, days, interval)
+    if data:
+        return data
+    # Try AlphaVantage intraday
+    data = fetch_alpha_vantage_intraday(ticker, interval="5min")
+    if data:
+        return data
+    return {}
+
+# ----------------------
+# LM Studio Client
+# ----------------------
+
+class LMStudioClient:
+    """Client for LM Studio server using lmstudio SDK."""
+    
+    def __init__(self, server_host: str, verbose: bool = False, timeout: float = 60.0):
+        host = normalize_server_host(server_host)
+        lms.configure_default_client(host)
+        self.model = lms.llm()
+        self.host = host
+        self.verbose = verbose
+        self.timeout = timeout
+    
+    def get_model_info(self) -> Optional[str]:
+        """Get current model identifier."""
+        try:
+            info = self.model.get_info()
+            return info.get("identifier") or info.get("modelKey") or info.get("displayName")
+        except Exception:
+            return None
+    
+    def call_structured(self, messages: List[Dict[str, Any]], schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Call model with structured output schema."""
+        import threading
+        result_holder = {}
+        error_holder = []
+        done = threading.Event()
+        
+        def _worker():
+            try:
+                chat = {"messages": messages}
+                config = {"temperature": 0.3, "max_new_tokens": 512}
+                res = self.model.respond(chat, response_format=schema, config=config)
+                parsed = getattr(res, "parsed", {})
+                if isinstance(parsed, dict):
+                    result_holder.update(parsed)
+            except Exception as e:
+                error_holder.append(e)
+            finally:
+                done.set()
+        
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        done.wait(self.timeout)
+        
+        if not done.is_set():
+            log(f"Model call timed out after {self.timeout}s")
+            return {}
+        
+        if error_holder:
+            raise error_holder[0]
+        
+        return result_holder
+
+# ----------------------
+# Phase 1: Initial Analysis
+# ----------------------
+
+INITIAL_SYSTEM_PROMPT = """You are a financial analyst. Given a news article and the US stock listings universe, identify up to 10 US-listed stocks that are most directly affected by this news.
+
+For each stock, provide:
+- Ticker symbol (must be from the provided listings)
+- Action: BUY or SELL based on the news sentiment and implications
+- Confidence: 0-100 (100 = extremely confident, act immediately; 70+ = strong signal; 50-69 = moderate; below 50 = weak)
+- Reason: Clear explanation (less than 200 words) of why this news affects the stock
+
+Key guidelines:
+1. If an article explicitly recommends buying a stock, give it BUY with HIGH confidence (70-90)
+2. If an article highlights positive developments, growth, or opportunities, lean toward BUY
+3. If an article mentions problems, risks, or negative developments, lean toward SELL
+4. Companies directly mentioned should have the highest confidence
+5. Competitors and related companies should have moderate confidence
+
+Focus on:
+- Companies directly mentioned in the article (highest priority)
+- Direct competitors or suppliers
+- Sector/industry peers that would be affected
+- Related ETFs if applicable
+
+For example, if an article says "2 Growth Stocks to Buy Right Now" and mentions Unity Software (U) and CoreWeave (CRWV), 
+you should return BUY recommendations for both with confidence 70+ since they are explicitly recommended.
+
+Return only valid JSON matching the schema."""
+
+def build_initial_schema() -> Dict[str, Any]:
+    """Build JSON schema for initial analysis."""
     return {
         "type": "object",
         "properties": {
-            "news_id": {"type": "string"},
-            "news_title": {"type": "string", "minLength": 1},
-            "link": {"type": "string", "minLength": 1, "pattern": r"^https?://.*$"},
-            "relevance": {"type": "string", "enum": ["none", "low", "medium", "high"]},
-            "relevance_reason": {"type": "string"},
             "decisions": {
                 "type": "array",
                 "maxItems": 10,
@@ -254,659 +693,488 @@ def build_response_schema() -> Dict[str, Any]:
                         "ticker": {"type": "string", "pattern": r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$"},
                         "action": {"type": "string", "enum": ["BUY", "SELL"]},
                         "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "reason": {"type": "string", "minLength": 3}
+                        "reason": {"type": "string", "minLength": 3, "maxLength": 600}
                     },
-                    "required": ["ticker", "action", "confidence"],
+                    "required": ["ticker", "action", "confidence", "reason"],
                     "additionalProperties": False
                 }
             }
         },
-        "required": ["news_id", "news_title", "link", "relevance", "relevance_reason", "decisions"],
+        "required": ["decisions"],
         "additionalProperties": False
     }
 
-# ----------------------
-# Text normalization helpers
-# ----------------------
-INVISIBLE_CATEGORIES = {"Cf", "Cc", "Cs"}
-def clean_text(s: Any) -> Any:
-    if not isinstance(s, str):
-        return s
-    s = unicodedata.normalize("NFKC", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) not in INVISIBLE_CATEGORIES)
-    return s.strip()
-
-# ----------------------
-# Core processing helpers
-# ----------------------
-
-def normalize_model_output(nid: str, title: str, link: str, parsed: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    if isinstance(parsed, dict):
-        out.update(parsed)
-
-    # Always trust our source metadata over model-provided copies
-    out["news_id"] = nid
-    out["news_title"] = clean_text(title)
-    out["link"] = clean_text(link)
-
-    decisions = out.get("decisions")
-    if not isinstance(decisions, list):
-        decisions = []
-    norm_decisions = []
-    for d in decisions[:10]:
-        if not isinstance(d, dict):
-            continue
-        tk = clean_text((d.get("ticker") or "").upper())
-        if not tk:
-            continue
-        act = clean_text((d.get("action") or "").upper())
-        if act not in {"BUY", "SELL"}:
-            continue
-        # Drop unknown/unlisted tickers
-        try:
-            if GLOBAL_LISTINGS and tk not in GLOBAL_LISTINGS:
-                continue
-        except NameError:
-            pass
-        try:
-            conf = int(d.get("confidence", 0))
-        except Exception:
-            conf = 0
-        conf = max(0, min(100, conf))
-        raw_reason = d.get("reason") or ""
-        reason = clean_text(raw_reason) if raw_reason else ""
-        if not reason:
-            reason = "Model provided no rationale; included due to article context."
-        norm_decisions.append({
-            "ticker": tk,
-            "action": act,
-            "confidence": conf,
-            "reason": reason[:240],
-        })
-    out["decisions"] = norm_decisions
-
-    rel = out.get("relevance")
-    if rel not in {"none", "low", "medium", "high"}:
-        rel = "none" if not norm_decisions else "low"
-    out["relevance"] = rel
-
-    rr = out.get("relevance_reason") or ""
-    rr = clean_text(rr)
-    if not rr:
-        if rel == "none" and not norm_decisions:
-            rr = "No directly affected US-listed issuer; generic/irrelevant to equities."
-        else:
-            rr = "Model-provided decisions imply some impact."
-    out["relevance_reason"] = rr[:280]
-    return out
-
-def write_processed_record(minute_key: str, news_id: str, record: Dict[str, Any]):
-    # Create ./data/llm/<YYMMDDHHMM>/ and write <news_id>.json inside it
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    minute_dir = PROCESSED_DIR / minute_key
-    minute_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"{news_id}.json" if news_id else "unknown.json"
-    out_path = minute_dir / fname
-    tmp = out_path.with_suffix(".tmp")
-
-    rec = {
-        **record,
-        "news_id": clean_text(record.get("news_id")),
-        "minute": clean_text(record.get("minute")),
-        "model": clean_text(record.get("model")),
+def analyze_news_initial(client: LMStudioClient, news_item: Dict[str, Any], listings: Dict[str, ListingItem]) -> List[Dict[str, Any]]:
+    """Perform initial analysis on a news item."""
+    # Extract mentioned tickers from article
+    article_body = news_item.get("article-body", "")
+    title = news_item.get("title", "")
+    
+    # Look for explicitly mentioned tickers in the article
+    mentioned_tickers = set()
+    text_to_search = title + " " + article_body
+    
+    # Look for patterns like "NYSE: U" or "NASDAQ: CRWV" or "(NASDAQ: CRWV)"
+    exchange_pattern = re.compile(r'\(?\b(?:NYSE|NASDAQ|NYSEARCA):\s*([A-Z]{1,5})\b\)?')
+    for match in exchange_pattern.finditer(text_to_search):
+        ticker = match.group(1)
+        if ticker in listings:
+            mentioned_tickers.add(ticker)
+            if client.verbose:
+                log(f"      Found exchange mention: {ticker}")
+    
+    # Look for specific company names mentioned
+    companies_to_check = {
+        "Unity Software": "U",
+        "CoreWeave": "CRWV",
+        "Apple": "AAPL",
+        "Microsoft": "MSFT",
+        "Nvidia": "NVDA",
+        "Tesla": "TSLA",
+        "Amazon": "AMZN",
+        "Google": "GOOGL",
+        "Meta": "META",
+        "Netflix": "NFLX",
     }
-    if isinstance(record.get("input"), dict):
-        rec["input"] = {
-            "title": clean_text(record["input"].get("title")),
-            "link": clean_text(record["input"].get("link")),
-        }
-    if isinstance(record.get("output"), dict):
-        outp = dict(record["output"])
-        outp["news_id"] = clean_text(outp.get("news_id"))
-        outp["news_title"] = clean_text(outp.get("news_title"))
-        outp["link"] = clean_text(outp.get("link"))
-        outp["relevance"] = clean_text(outp.get("relevance"))
-        outp["relevance_reason"] = clean_text(outp.get("relevance_reason"))
-        decs = []
-        for d in outp.get("decisions", []) or []:
-            if not isinstance(d, dict):
-                continue
-            entry = {
-                "ticker": clean_text(d.get("ticker")),
-                "action": clean_text(d.get("action")),
-                "confidence": int(d.get("confidence", 0)),
-                "reason": clean_text(d.get("reason"))[:240],
-            }
-            # Optional refined fields
-            if d.get("refined_confidence") is not None:
-                try:
-                    entry["refined_confidence"] = int(d.get("refined_confidence"))
-                except Exception:
-                    pass
-            if d.get("refined_reason"):
-                entry["refined_reason"] = clean_text(d.get("refined_reason"))[:240]
-            if d.get("refined_at_utc"):
-                entry["refined_at_utc"] = clean_text(d.get("refined_at_utc"))
-            decs.append(entry)
-        outp["decisions"] = decs
-        rec["output"] = outp
-
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rec, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, out_path)
-
-TICKER_RE = re.compile(r"\b[A-Z]{1,5}(?:\.[A-Z]{1,2})?\b")
-
-def extract_candidate_tickers(text: str, listings: Dict[str, ListingItem]) -> List[str]:
-    if not text:
-        return []
-    found = set()
-    for m in TICKER_RE.finditer(text.upper()):
-        t = m.group(0)
-        if t in listings:
-            found.add(t)
-    return sorted(found)
+    
+    for company_name, ticker in companies_to_check.items():
+        if company_name.lower() in text_to_search.lower() and ticker in listings:
+            mentioned_tickers.add(ticker)
+            if client.verbose:
+                log(f"      Found company name: {company_name} -> {ticker}")
+    
+    # Also check for exact full company names from listings
+    for ticker, listing in listings.items():
+        if listing.name and len(listing.name) > 5:  # Skip very short names
+            # Check for exact company name matches (case insensitive)
+            if listing.name.lower() in text_to_search.lower():
+                mentioned_tickers.add(ticker)
+                if client.verbose:
+                    log(f"      Found full company name: {listing.name} -> {ticker}")
+    
+    # Build focused ticker list for context (mentioned + sample of others)
+    ticker_context = list(mentioned_tickers) + list(listings.keys())[:200]
+    
+    user_content = {
+        "news": {
+            "title": title,
+            "link": news_item.get("link", ""),
+            "body": article_body[:4000],  # Increase body size
+            "published": news_item.get("published_at_utc", ""),
+            "source": news_item.get("source_title", ""),
+        },
+        "mentioned_tickers": list(mentioned_tickers),
+        "sample_tickers": ticker_context[:500],
+        "instructions": (
+            "Analyze this news and identify affected stocks with trading recommendations. "
+            f"The article explicitly mentions these tickers: {list(mentioned_tickers)}. "
+            "Focus on companies directly mentioned, their competitors, and related ETFs."
+        )
+    }
+    
+    messages = [
+        {"role": "system", "content": INITIAL_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)}
+    ]
+    
+    schema = build_initial_schema()
+    
+    # Add debug logging
+    if client.verbose:
+        log(f"    Mentioned tickers found in article: {mentioned_tickers}")
+    
+    result = client.call_structured(messages, schema)
+    
+    # Debug log the raw result
+    if client.verbose and result:
+        log(f"    Raw LLM response: {json.dumps(result, indent=2)[:500]}...")
+    
+    # Validate and clean results
+    decisions = result.get("decisions", [])
+    if not decisions and client.verbose:
+        log("    WARNING: LLM returned no decisions")
+    
+    valid_decisions = []
+    
+    for decision in decisions:
+        ticker = decision.get("ticker", "").upper()
+        # Only include tickers that exist in our listings
+        if ticker in listings:
+            # Get the raw values first for debugging
+            raw_confidence = decision.get("confidence")
+            raw_reason = decision.get("reason", "")
+            
+            if client.verbose:
+                log(f"    Processing decision for {ticker}: confidence={raw_confidence}, reason_len={len(raw_reason)}")
+            
+            # Clean and validate
+            confidence = max(0, min(100, int(raw_confidence) if raw_confidence is not None else 0))
+            reason = clean_text(raw_reason) if raw_reason else "No reason provided"
+            
+            valid_decisions.append({
+                "ticker": ticker,
+                "action": decision.get("action", "BUY"),
+                "confidence": confidence,
+                "reason": truncate_with_ellipsis(reason, 200),
+                "company_name": listings[ticker].name,
+            })
+        elif client.verbose:
+            log(f"    Skipping unknown ticker: {ticker}")
+    
+    return valid_decisions
 
 # ----------------------
-# Enrichment: Google News RSS + Yahoo Finance chart API
+# Phase 2: Enrichment and Refinement
 # ----------------------
 
-HTTP_TIMEOUT = (8, 15)  # (connect, read) seconds
-HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
-    )
-}
+REFINE_SYSTEM_PROMPT = """You are a senior financial analyst performing a detailed second review of a trading recommendation.
 
-def google_news_rss(company: str, ticker: str, days: int, max_items: int = 10) -> List[Dict[str, Any]]:
-    """Query Google News RSS for the last N days using a robust query of name OR ticker."""
-    # Example: https://news.google.com/rss/search?q=AAPL%20OR%20%22Apple%20Inc%22%20when%3A30d&hl=en-US&gl=US&ceid=US:en
-    q = f"{ticker} OR \"{company}\" when:{days}d"
-    url = (
-        "https://news.google.com/rss/search?" 
-        + f"q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
-    )
-    try:
-        resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        fp = feedparser.parse(resp.content)
-        items = []
-        for e in fp.entries[: max_items * 2]:  # oversample then trim uniques
-            title = e.get("title", "").strip()
-            link = (e.get("link") or "").strip()
-            published = e.get("published", "") or e.get("updated", "")
-            source = ""
-            if "source" in e and isinstance(e.source, dict):
-                source = e.source.get("title") or ""
-            if title and link:
-                items.append({
-                    "title": clean_text(title),
-                    "link": clean_text(link),
-                    "published": clean_text(published),
-                    "source": clean_text(source),
-                })
-        # Deduplicate by link
-        seen = set()
-        deduped = []
-        for it in items:
-            if it["link"] in seen:
-                continue
-            seen.add(it["link"])
-            deduped.append(it)
-        return deduped[:max_items]
-    except Exception:
-        return []
+Given:
+1. The original news article and initial recommendation
+2. Recent news from Google News and Yahoo Finance (last 30 days)
+3. Detailed price data with high precision (5-minute intervals)
 
-def yahoo_symbol_from(ticker: str) -> str:
-    # Yahoo uses '-' instead of '.' for class shares (e.g., BRK-B)
-    return ticker.replace(".", "-")
+Your task:
+- Provide a REVISED confidence level (0-100) for the same action
+- Specify an expected target price based on your analysis
+- Give a detailed reason (up to 200 words) for your revised assessment
 
-def yahoo_prices(ticker: str, days: int) -> Dict[str, Any]:
-    """Fetch recent price series from Yahoo chart endpoint.
-    Returns {meta: {...}, points: [{t, c, v}], interval: str} or {} on failure.
-    """
-    sym = yahoo_symbol_from(ticker)
-    interval = "5m" if days <= 7 else "1h"
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?"
-        f"range={days}d&interval={interval}&includePrePost=true"
-    )
-    try:
-        resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        result = (data.get("chart", {}).get("result") or [None])[0]
-        if not result:
-            return {}
-        meta = result.get("meta", {})
-        tzoff = int(meta.get("gmtoffset", 0))
-        ts = result.get("timestamp") or []
-        quotes = (result.get("indicators", {}).get("quote") or [{}])[0]
-        closes = quotes.get("close") or []
-        vols = quotes.get("volume") or []
-        points = []
-        for i, t in enumerate(ts):
-            c = closes[i] if i < len(closes) else None
-            v = vols[i] if i < len(vols) else None
-            if c is None:
-                continue
-            # Convert epoch (sec) + tz offset to ISO UTC string for consistency
-            iso = datetime.fromtimestamp(int(t), tz=timezone.utc).isoformat(timespec="seconds")
-            points.append({"t": iso, "c": float(c), "v": int(v) if v is not None else None})
-        return {
-            "meta": {"symbol": sym, "interval": interval, "timezone_offset": tzoff},
-            "points": points,
-            "interval": interval,
-        }
-    except Exception:
-        return {}
+Consider:
+- Has the stock already moved significantly in response to similar news?
+- Are there contradicting signals in recent news?
+- What does the price action suggest about market sentiment?
+- Is the opportunity still actionable or has it passed?
 
-def summarize_prices(points: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not points:
-        return {}
-    first = points[0]["c"]
-    last = points[-1]["c"]
-    chg = (last - first)
-    pct = (chg / first * 100.0) if first else 0.0
-    return {"first": first, "last": last, "abs_change": chg, "pct_change": pct}
-
-REFINE_SYSTEM = (
-    "You are a second-pass verifier for trading signals. Given the original decision "
-    "and supplemental evidence (recent headlines and recent price action), output a revised "
-    "confidence for the SAME action on the SAME ticker. Additionally:\n"
-    "1) Estimate a *near-term horizon* in HOURS (positive integer) that is appropriate for this setup/impact/liquidity.\n"
-    "2) Estimate the *expected high price* within that horizon and optionally provide up to two intermediate anchors "
-    "(price and confidence) between the current price and the expected high.\n\n"
-    "Rules:\n"
-    "- Keep the action unchanged.\n"
-    "- 'horizon_hours' must be a positive integer (e.g., 1–72 hours is typical; longer only if clearly justified by the article).\n"
-    "- 'expected_high_price' must be a positive float in the same currency as the input prices.\n"
-    "- Confidence is 0–100. Assume confidence decays to **0 at the expected_high_price** if action=BUY; "
-    "if action=SELL, assume confidence decays to 0 at the expected_low_price (still use the field name 'expected_high_price' but it may be below current).\n"
-    "- Anchors, if provided, must be strictly between the current price and the expected_high_price and have confidence between 0 and the revised confidence.\n"
-    "Return JSON only."
-)
+Be conservative - if the stock has already moved substantially, reduce confidence accordingly.
+Return only valid JSON matching the schema."""
 
 def build_refine_schema() -> Dict[str, Any]:
+    """Build JSON schema for refinement analysis."""
     return {
         "type": "object",
         "properties": {
             "ticker": {"type": "string"},
             "action": {"type": "string", "enum": ["BUY", "SELL"]},
-            "previous_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+            "original_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
             "revised_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-            "reasoning": {"type": "string", "minLength": 5},
             "expected_high_price": {"type": "number", "minimum": 0},
-            "anchors": {
-                "type": "array",
-                "maxItems": 2,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "price": {"type": "number"},
-                        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "label": {"type": "string"}
-                    },
-                    "required": ["price", "confidence"],
-                    "additionalProperties": False
-                }
-            },
-            "horizon_hours": {"type": "integer", "minimum": 1, "maximum": 240}
+            "horizon_hours": {"type": "integer", "minimum": 1, "maximum": 168},  # Up to 1 week
+            "reasoning": {"type": "string", "minLength": 10, "maxLength": 600}
         },
-        "required": ["ticker", "action", "previous_confidence", "revised_confidence", "reasoning", "horizon_hours"],
+        "required": ["ticker", "action", "original_confidence", "revised_confidence", 
+                   "expected_high_price", "horizon_hours", "reasoning"],
         "additionalProperties": False
     }
 
-def build_refine_messages(news_item: Dict[str, Any], decision: Dict[str, Any], gnews: List[Dict[str, Any]], yprices: Dict[str, Any]) -> List[Dict[str, Any]]:
-    price_summary = summarize_prices(yprices.get("points", []))
-    payload = {
+def refine_decision(client: LMStudioClient, news_item: Dict[str, Any], decision: Dict[str, Any],
+                    google_news: List[Dict[str, Any]], alt_news: List[Dict[str, Any]], 
+                    price_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Refine a high-confidence decision with additional data."""
+    
+    # Combine all available news sources
+    all_recent_news = []
+    
+    # Add Google News items
+    for item in google_news[:7]:
+        all_recent_news.append({
+            "title": item["title"],
+            "source": item.get("source", "Google News"),
+            "published": item.get("published", ""),
+        })
+    
+    # Add alternative news items (Polygon, Finnhub, AlphaVantage, GDELT, etc.)
+    for item in alt_news[:7]:
+        all_recent_news.append({
+            "title": item["title"],
+            "source": item.get("source", "Alternative News"),
+            "published": item.get("published", ""),
+        })
+    
+    # Prepare price summary
+    price_summary = {}
+    if price_data and "stats" in price_data:
+        stats = price_data["stats"]
+        price_summary = {
+            "current_price": stats.get("current"),
+            "period_high": stats.get("period_high"),
+            "period_low": stats.get("period_low"),
+            "change_pct": stats.get("pct_change"),
+            "recent_points": price_data.get("points", [])[-20:],  # Last 20 data points
+        }
+    
+    user_content = {
         "original_news": {
-            "title": news_item.get("title"),
-            "link": news_item.get("link"),
-            "published_at_utc": news_item.get("published_at_utc"),
+            "title": news_item.get("title", ""),
+            "body_excerpt": news_item.get("article-body", "")[:1000],
+            "published": news_item.get("published_at_utc", ""),
         },
-        "decision": decision,
-        "google_news": gnews,
-        "price_summary": price_summary,
-        "price_points_tail": yprices.get("points", [])[-50:],
-        "current_price": (price_summary.get("last") if isinstance(price_summary, dict) else None),
+        "initial_decision": {
+            "ticker": decision["ticker"],
+            "action": decision["action"],
+            "confidence": decision["confidence"],
+            "reason": decision["reason"],
+        },
+        "recent_news": all_recent_news,
+        "price_data": price_summary,
         "instructions": (
-            "Select a plausible near-term 'horizon_hours' based on article severity and recent price path. "
-            "Estimate expected_high_price within that horizon. Confidence must be 0 at the expected high price (for BUY). "
-            "Optionally provide up to 2 anchors between current price and expected high."
+            "Review the initial decision with this additional context. "
+            "If the stock has already moved significantly based on similar news, reduce confidence. "
+            "Provide realistic target price and timeframe."
         )
     }
-    return [
-        {"role": "system", "content": REFINE_SYSTEM},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+    
+    messages = [
+        {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)}
     ]
-def build_confidence_curve(current_price: Optional[float], current_conf: int, expected_high: Optional[float], anchors: Optional[List[Dict[str, Any]]], steps: int, action: str) -> Dict[str, Any]:
-    """
-    Build a monotonic curve from current price to expected_high where confidence decays to 0 at the endpoint.
-    For SELL actions, the expected_high may be below current; we still treat it as the terminal price where confidence=0.
-    Returns {"expected_high": float, "curve": [{"price":p,"confidence":c}, ...]}
-    """
-    try:
-        steps = max(2, int(steps))
-    except Exception:
-        steps = 5
-    if current_price is None or not isinstance(current_price, (int, float)) or current_price <= 0:
-        return {"expected_high": None, "curve": []}
-    # Fallback expected_high if missing or invalid: extrapolate using recent pct change or +1%
-    if expected_high is None or not isinstance(expected_high, (int, float)) or expected_high <= 0 or expected_high == current_price:
-        # simple fallback: 1% away from current in the direction of action
-        bump = 0.01 * current_price
-        expected_high = (current_price + bump) if (str(action).upper() == "BUY") else (current_price - bump)
-    # Normalize anchors
-    norm_anchors: List[Tuple[float, int]] = []
-    if anchors:
-        for a in anchors:
-            try:
-                ap = float(a.get("price"))
-                ac = int(a.get("confidence"))
-                norm_anchors.append((ap, max(0, min(100, ac))))
-            except Exception:
-                continue
-    # Build base grid
-    prices: List[float] = []
-    if steps <= 2:
-        prices = [current_price, expected_high]
-    else:
-        for i in range(steps):
-            t = i / (steps - 1)
-            p = current_price + (expected_high - current_price) * t
-            prices.append(p)
-    # Seed confidences with linear decay as default
-    confs = [max(0, min(100, int(round(current_conf * (1 - (i / (len(prices) - 1))))))) for i in range(len(prices))]
-    # Blend in anchors: snap confidence at nearest price index to anchor confidence, then ensure monotonic non-increasing toward endpoint
-    for ap, ac in norm_anchors:
-        # find nearest index
-        idx = min(range(len(prices)), key=lambda k: abs(prices[k] - ap))
-        confs[idx] = max(0, min(100, ac))
-    # Enforce monotone decay to 0 at endpoint
-    confs[0] = max(0, min(100, int(current_conf)))
-    confs[-1] = 0
-    for i in range(1, len(confs)):
-        if confs[i] > confs[i-1]:
-            confs[i] = confs[i-1]
-    return {"expected_high": float(expected_high), "curve": [{"price": float(prices[i]), "confidence": int(confs[i])} for i in range(len(prices))]}
+    
+    schema = build_refine_schema()
+    result = client.call_structured(messages, schema)
+    
+    # Merge with original decision
+    refined = decision.copy()
+    if result:
+        # Handle confidence
+        refined["revised_confidence"] = max(0, min(100, result.get("revised_confidence", decision["confidence"])))
+        
+        # Handle expected price
+        expected_price = result.get("expected_high_price", 0)
+        refined["expected_high_price"] = expected_price if expected_price > 0 else None
+        
+        # Handle timeframe
+        refined["horizon_hours"] = result.get("horizon_hours", 24)
+        
+        # Handle reasoning - ensure we get valid text
+        raw_reasoning = result.get("reasoning", "")
+        if raw_reasoning and isinstance(raw_reasoning, str) and len(raw_reasoning) > 10:
+            cleaned_reason = clean_text(raw_reasoning)
+            # Check if reason is just dots/ellipsis or garbage
+            if cleaned_reason and not all(c in "... " for c in cleaned_reason):
+                refined["refined_reason"] = truncate_with_ellipsis(cleaned_reason, 200)
+            else:
+                refined["refined_reason"] = "Model refinement analysis based on recent news and price action"
+        else:
+            refined["refined_reason"] = "Unable to refine - model response unclear"
+            
+        refined["refinement_timestamp"] = datetime.now(timezone.utc).isoformat()
+    
+    return refined
 
 # ----------------------
-# LLM client (lmstudio-python SDK)
+# Main Processing
 # ----------------------
 
-class LMStudioClient:
-    def __init__(self, server_host: str, verbose: bool = False):
-        # Must be the first call before using convenience API. See docs.
-        # https://lmstudio.ai/docs/python/getting-started/project-setup
-        host = normalize_server_host(server_host)
-        lms.configure_default_client(host)
-        # Use the currently selected model in LM Studio (no explicit identifier here)
-        self.model = lms.llm()
-        self.host = host
-        self.verbose = verbose
-
-
-    def get_current_model_identifier(self) -> Optional[str]:
-        try:
-            info = self.model.get_info()
-            return info.get("identifier") or info.get("modelKey") or info.get("displayName")
-        except Exception:
-            return None
-
-    def respond_structured(self, messages: List[Dict[str, Any]], schema: Dict[str, Any]) -> Dict[str, Any]:
-        chat = {"messages": messages}
-        cfg = {"temperature": 0.2}  # effort/limits are configured in LM Studio UI
-        result = self.model.respond(chat, response_format=schema, config=cfg)
-        return getattr(result, "parsed", {}) or {}
-
-# ----------------------
-# Core processing
-# ----------------------
-
-def build_messages(listings: Dict[str, ListingItem], news: Dict[str, Any]) -> List[Dict[str, Any]]:
-    news_id = news.get("id") or ""
-    title = news.get("title") or ""
-    link = news.get("link") or ""
-    body = news.get("article-body") or ""
-
-    candidates = extract_candidate_tickers(" ".join([title, body]), listings)
-
-    system_msg = {"role": "system", "content": SYSTEM_TEMPLATE}
-
-    user_payload = {
+def process_news_item(client: LMStudioClient, news_item: Dict[str, Any], listings: Dict[str, ListingItem],
+                      confidence_threshold: int = 70, news_days: int = 30, price_days: int = 7,
+                      verbose: bool = False) -> Dict[str, Any]:
+    """Process a single news item through both phases."""
+    
+    news_id = news_item.get("id", "unknown")
+    log(f"Processing news: {news_item.get('title', 'Unknown')[:80]}...", verbose)
+    
+    # Phase 1: Initial analysis
+    log("  Phase 1: Initial analysis...", verbose)
+    initial_decisions = analyze_news_initial(client, news_item, listings)
+    log(f"  Found {len(initial_decisions)} affected stocks", verbose)
+    
+    # Phase 2: Enrichment for high-confidence decisions
+    refined_decisions = []
+    for decision in initial_decisions:
+        ticker = decision["ticker"]
+        confidence = decision["confidence"]
+        
+        if confidence >= confidence_threshold:
+            log(f"  Phase 2: Enriching {ticker} (confidence: {confidence}%)...", verbose)
+            
+            # Fetch additional data
+            company_name = decision.get("company_name", ticker)
+            google_news = fetch_google_news(company_name, ticker, news_days)
+            alt_news, alt_news_sources = fetch_company_news(ticker, company_name, news_days)
+            price_data = fetch_price_data(ticker, price_days, interval="5m")
+            
+            log(f"    Fetched {len(google_news)} Google news, {len(alt_news)} alt news items", verbose)
+            if verbose and alt_news:
+                source_used = [k for k, v in alt_news_sources.items() if v > 0]
+                log(f"    Alt news source: {source_used[0] if source_used else 'none'}")
+            
+            # Refine decision
+            refined = refine_decision(client, news_item, decision, google_news, alt_news, price_data)
+            
+            # Add enrichment data to result with detailed counts
+            refined["news_sources"] = {
+                "google": len(google_news),
+                **alt_news_sources
+            }
+            refined["total_news_count"] = len(google_news) + len(alt_news)
+            refined["has_price_data"] = bool(price_data)
+            
+            if verbose and "revised_confidence" in refined:
+                log(f"    Revised confidence: {refined['revised_confidence']}% (was {confidence}%)", verbose)
+            
+            refined_decisions.append(refined)
+        else:
+            refined_decisions.append(decision)
+    
+    # Build result
+    result = {
         "news_id": news_id,
-        "news_title": title,
-        "link": link,
-        "published_at_utc": news.get("published_at_utc"),
-        "source": news.get("source_title") or news.get("source_domain"),
-        "candidate_tickers_in_text": candidates,
-        "response_schema": RESPONSE_SCHEMA_EXAMPLE,
-        "instructions": (
-            "Return only valid JSON. Include 0–10 items in 'decisions'. "
-            "If the article is generic personal finance/advice or otherwise irrelevant to listed issuers, set 'relevance'='none' and return an empty 'decisions' array. "
-            "Use tools to validate tickers against the listings if unsure."
-        ),
-        "article_body": body[:8000],
+        "news_title": news_item.get("title", ""),
+        "news_link": news_item.get("link", ""),
+        "published_at": news_item.get("published_at_utc", ""),
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "model": client.get_model_info(),
+        "decisions": refined_decisions,
+        "summary": {
+            "total_decisions": len(refined_decisions),
+            "high_confidence_count": sum(1 for d in refined_decisions 
+                                        if d.get("revised_confidence", d.get("confidence", 0)) >= confidence_threshold),
+            "enriched_count": sum(1 for d in refined_decisions if "revised_confidence" in d),
+        }
     }
+    
+    return result
 
-    return [system_msg, {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}]
+def save_results(results: List[Dict[str, Any]], minute_key: str):
+    """Save processing results to file."""
+    ensure_dirs()
+    
+    # Create timestamped filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"results_{minute_key}_{timestamp}.json"
+    filepath = RESULT_DIR / filename
+    
+    # Also save as latest
+    latest_path = RESULT_DIR / "latest_results.json"
+    
+    # Save to both files
+    for path in [filepath, latest_path]:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+    
+    log(f"Saved results to {filepath}")
+    return filepath
 
-def write_decisions(minute_key: str, results: List[Dict[str, Any]]):
-    # Aggregate file resides at ./data/llm/<YYMMDDHHMM>/<YYMMDDHHMM>.json
-    base_dir = PROCESSED_DIR / minute_key
-    base_dir.mkdir(parents=True, exist_ok=True)
-    out_path = base_dir / f"{minute_key}.json"
-
-    # Merge with existing if present
-    existing: List[Dict[str, Any]] = []
-    if out_path.exists():
-        try:
-            with open(out_path, "r", encoding="utf-8") as rf:
-                prev = json.load(rf)
-                if isinstance(prev, list):
-                    existing = prev
-        except Exception:
-            existing = []
-    existing_ids = {str(r.get("news_id")) for r in existing}
-    new_unique = [r for r in results if str(r.get("news_id")) not in existing_ids]
-    combined = existing + new_unique
-
-    tmp = out_path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(combined, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, out_path)
-
-def minute_from_filename(path: Path) -> str:
-    return path.stem  # 'YYMMDDHHMM'
-
-# Global listings cache
-GLOBAL_LISTINGS: Dict[str, ListingItem] = {}
+# ----------------------
+# Main Entry Point
+# ----------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM decision engine using LM Studio (native SDK)")
-    parser.add_argument(
-        "--server-host",
-        default=DEFAULT_SERVER_HOST,
-        help=(
-            "LM Studio server host:port (default: %s). 'http://' prefix is accepted and will be normalized."
-            % DEFAULT_SERVER_HOST
-        ),
-    )
-    parser.add_argument("--poll-interval", type=float, default=10.0, help="Seconds between checks for new news")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
-    parser.add_argument("--conf-threshold", type=int, default=60, help="Confidence threshold (inclusive) to trigger enrichment & refinement")
-    parser.add_argument("--news-window-days", type=int, default=30, help="Days of Google News headlines to fetch per ticker")
-    parser.add_argument("--price-window-days", type=int, default=7, help="Days of recent price history to fetch per ticker")
-    parser.add_argument("--max-news", type=int, default=10, help="Max Google News items to include in refinement")
-    # REMOVED: parser.add_argument("--horizon-hours", type=int, default=6, help="Near-term horizon for expected-high estimate (hours)")
-    parser.add_argument("--confidence-curve-steps", type=int, default=5, help="Number of points (including endpoints) for the price→confidence curve")
+    parser = argparse.ArgumentParser(description="Enhanced LLM decision engine (llm2.py)")
+    parser.add_argument("--server-host", default="localhost:1234", 
+                       help="LM Studio server host:port")
+    parser.add_argument("--confidence-threshold", type=int, default=70,
+                       help="Minimum confidence for enrichment (0-100)")
+    parser.add_argument("--news-days", type=int, default=30,
+                       help="Days of news history to fetch")
+    parser.add_argument("--price-days", type=int, default=7,
+                       help="Days of price history to fetch")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                       help="Verbose output")
+    parser.add_argument("--test", action="store_true",
+                       help="Run test with data/news/2508242333.json")
+    
     args = parser.parse_args()
-
+    
+    # Initialize
     ensure_dirs()
-    con = decisions_db_init()
-
-    # Load listings (global)
-    global GLOBAL_LISTINGS
-    GLOBAL_LISTINGS = load_listings()
-    if args.verbose:
-        log(f"Loaded {len(GLOBAL_LISTINGS)} listings.", True)
-
-    # Init client and sanity-check loaded models
-    server_host_norm = normalize_server_host(args.server_host)
-    if args.verbose:
-        log(f"Connecting to LM Studio at {server_host_norm}", True)
-    client = LMStudioClient(server_host=server_host_norm, verbose=args.verbose)
-    if args.verbose:
-        log(f"LM Studio client initialized for {server_host_norm}. Inference will confirm connectivity/model selection.", True)
-
-    # Main loop: always use the latest news file available
-    try:
-        while True:
-            nf = latest_news_file()
-            if nf is None:
-                log("No news files found yet…", args.verbose)
-                time.sleep(args.poll_interval)
-                continue
-
-            minute_key = minute_from_filename(nf)
-            log(f"Using latest news file {nf.name} (minute {minute_key})", args.verbose)
-
-            news_items = load_news(nf)
-            total_items = len(news_items)
-            unseen = 0
-            decisions: List[Dict[str, Any]] = []
-
-            for item in news_items:
-                nid = item.get("id") or ""
-                if not nid:
-                    continue
-                if already_processed(con, nid):
-                    continue
-                unseen += 1
-
-                messages = build_messages(GLOBAL_LISTINGS, item)
-                schema = build_response_schema()
-                if args.verbose:
-                    log("LLM round 1…", True)
-                try:
-                    parsed = client.respond_structured(messages, schema)
-                except Exception as e:
-                    parsed = {"error": repr(e), "decisions": [], "relevance": "none", "relevance_reason": "Model call failed."}
-
-                normalized = normalize_model_output(nid, item.get("title") or "", item.get("link") or "", parsed)
-
-                # --- Enrichment + refinement for high-confidence decisions ---
-                try:
-                    threshold = max(0, min(100, int(args.conf_threshold)))
-                except Exception:
-                    threshold = 60
-                refine_schema = build_refine_schema()
-
-                # Update normalized decisions in-place with refined results
-                for idx, dec in enumerate(list(normalized.get("decisions", []))):
-                    try:
-                        if int(dec.get("confidence", 0)) < threshold:
-                            continue
-                    except Exception:
-                        continue
-                    ticker = dec.get("ticker")
-                    if not ticker:
-                        continue
-                    listing = GLOBAL_LISTINGS.get(ticker)
-                    company = listing.name if listing and listing.name else ticker
-
-                    # Fetch enrichment data
-                    gnews = google_news_rss(company, ticker, int(args.news_window_days), max_items=int(args.max_news))
-                    yprices = yahoo_prices(ticker, int(args.price_window_days))
-
-                    # Ask the model to revise confidence
-                    refine_msgs = build_refine_messages(item, dec, gnews, yprices)
-                    try:
-                        refined = client.respond_structured(refine_msgs, refine_schema)
-                    except Exception as e:
-                        refined = {
-                            "ticker": ticker,
-                            "action": dec.get("action"),
-                            "previous_confidence": int(dec.get("confidence", 0)),
-                            "revised_confidence": int(dec.get("confidence", 0)),
-                            "reasoning": f"Refinement failed: {e!r}",
-                        }
-
-                    # Persist refined confidence & reason into the decision
-                    try:
-                        prev_c = int(refined.get("previous_confidence", dec.get("confidence", 0)))
-                        new_c = int(refined.get("revised_confidence", prev_c))
-                    except Exception:
-                        prev_c = int(dec.get("confidence", 0))
-                        new_c = prev_c
-                    reason_text = refined.get("reasoning", "")
-
-                    # Update the normalized decision entry
-                    normalized["decisions"][idx]["refined_confidence"] = new_c
-                    if reason_text:
-                        normalized["decisions"][idx]["refined_reason"] = clean_text(str(reason_text))[:240]
-                    normalized["decisions"][idx]["refined_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-                    # Build and attach a price→confidence curve
-                    current_price = (summarize_prices(yprices.get("points", [])).get("last") if isinstance(yprices, dict) else None)
-                    expected_high = refined.get("expected_high_price")
-                    anchors = refined.get("anchors")
-                    act = (refined.get("action") or dec.get("action") or "").upper()
-                    curve = build_confidence_curve(current_price, new_c, expected_high, anchors, int(args.confidence_curve_steps), act)
-                    chosen_h = refined.get("horizon_hours")
-                    try:
-                        chosen_h = int(chosen_h) if chosen_h is not None else 6
-                    except Exception:
-                        chosen_h = 6
-                    normalized["decisions"][idx]["price_path"] = {
-                        "horizon_hours": chosen_h,
-                        "expected_high": curve.get("expected_high"),
-                        "curve": curve.get("curve", [])
-                    }
-
-                    # Print on screen
-                    try:
-                        log(f"Refined {ticker} {act}: {prev_c}% -> {new_c}% — {str(reason_text)[:160]}", True)
-                    except Exception:
-                        log(f"Refined {ticker}: (unable to print refined output)", True)
-
-                # Build record AFTER refinement so JSON includes refined fields
-                record = {
-                    "news_id": nid,
-                    "minute": minute_key,
-                    "model": client.get_current_model_identifier(),
-                    "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "input": {
-                        "title": item.get("title"),
-                        "link": item.get("link"),
-                    },
-                    "output": normalized,
-                }
-
-                # Write per-news processed JSON (now contains refined fields)
-                write_processed_record(minute_key, nid, record)
-
-                decisions.append(record)
-                mark_processed(con, nid, minute_key)
-
-            log(f"Latest file has {total_items} item(s); unseen this pass: {unseen}.", args.verbose)
-
-            if decisions:
-                write_decisions(minute_key, decisions)
-                log(f"Wrote {len(decisions)} decision(s) to {minute_key}/{minute_key}.json", args.verbose)
-            else:
-                log("No new news to process in the latest file.", args.verbose)
-
-            time.sleep(args.poll_interval)
-
-    except KeyboardInterrupt:
-        log("Interrupted — shutting down.", True)
-    except SystemExit:
-        pass
+    log("Loading stock listings...", args.verbose)
+    listings = load_listings()
+    log(f"Loaded {len(listings)} stocks", args.verbose)
+    
+    # Connect to LM Studio
+    log(f"Connecting to LM Studio at {args.server_host}...", args.verbose)
+    client = LMStudioClient(args.server_host, verbose=args.verbose)
+    model_info = client.get_model_info()
+    log(f"Connected. Model: {model_info}", args.verbose)
+    
+    # Determine which news file to use
+    if args.test:
+        news_file = Path("data/news/2508242333.json")
+        if not news_file.exists():
+            print(f"Test file not found: {news_file}")
+            sys.exit(1)
+        log(f"Using test file: {news_file}", args.verbose)
+    else:
+        news_file = find_latest_news_file()
+        if not news_file:
+            print("No news files found in data/news/")
+            sys.exit(1)
+        log(f"Using latest news: {news_file}", args.verbose)
+    
+    # Load and process news
+    news_items = load_news(news_file)
+    log(f"Found {len(news_items)} news items", args.verbose)
+    
+    if not news_items:
+        print("No news items to process")
+        sys.exit(0)
+    
+    # Process each news item
+    results = []
+    for i, news_item in enumerate(news_items, 1):
+        log(f"\n[{i}/{len(news_items)}] Processing news item...", args.verbose)
+        
+        try:
+            result = process_news_item(
+                client, news_item, listings,
+                confidence_threshold=args.confidence_threshold,
+                news_days=args.news_days,
+                price_days=args.price_days,
+                verbose=args.verbose
+            )
+            results.append(result)
+            
+            # Show summary
+            if result["decisions"]:
+                log(f"  Decisions made: {len(result['decisions'])}", True)
+                for dec in result["decisions"]:
+                    conf = dec.get("revised_confidence", dec.get("confidence", 0))
+                    log(f"    {dec['ticker']}: {dec['action']} @ {conf}%", True)
+        except Exception as e:
+            log(f"  Error processing: {e}", True)
+            results.append({
+                "news_id": news_item.get("id", "unknown"),
+                "news_title": news_item.get("title", ""),
+                "error": str(e),
+                "decisions": []
+            })
+    
+    # Save results
+    minute_key = news_file.stem  # YYMMDDHHMM
+    output_path = save_results(results, minute_key)
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("PROCESSING COMPLETE")
+    print("="*60)
+    total_decisions = sum(len(r.get("decisions", [])) for r in results)
+    high_conf = sum(
+        1 for r in results 
+        for d in r.get("decisions", [])
+        if d.get("revised_confidence", d.get("confidence", 0)) >= args.confidence_threshold
+    )
+    print(f"News items processed: {len(results)}")
+    print(f"Total decisions: {total_decisions}")
+    print(f"High confidence (>={args.confidence_threshold}%): {high_conf}")
+    print(f"Results saved to: {output_path}")
+    
+    # If test mode, show specific results for U and CRWV
+    if args.test:
+        print("\n" + "="*60)
+        print("TEST RESULTS FOR U AND CRWV:")
+        print("="*60)
+        for result in results:
+            for decision in result.get("decisions", []):
+                if decision["ticker"] in ["U", "CRWV"]:
+                    print(f"\n{decision['ticker']}:")
+                    print(f"  Action: {decision['action']}")
+                    print(f"  Initial confidence: {decision['confidence']}%")
+                    if "revised_confidence" in decision:
+                        print(f"  Revised confidence: {decision['revised_confidence']}%")
+                        print(f"  Expected price: ${decision.get('expected_high_price', 'N/A')}")
+                        print(f"  Reason: {decision.get('refined_reason', decision['reason'])}")
+                    else:
+                        print(f"  Reason: {decision['reason']}")
 
 if __name__ == "__main__":
     main()
