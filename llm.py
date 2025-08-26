@@ -355,20 +355,29 @@ def fetch_alpha_vantage_news(ticker: str, max_items: int = 20) -> List[Dict[str,
 
 
 def fetch_gdelt_news(query_text: str, days: int = 30, max_items: int = 20) -> List[Dict[str, Any]]:
-    """GDELT 2.0 Doc API (no key). Docs: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/"""
+    """GDELT 2.0 Doc API (no key). Docs: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
+    Honors the `days` window via the `timespan` parameter.
+    """
     url = "https://api.gdeltproject.org/api/v2/doc/doc"
-    params = {"query": query_text, "mode": "ArtList", "maxrecords": str(max_items), "format": "json"}
+    params = {
+        "query": query_text,
+        "mode": "ArtList",
+        "maxrecords": str(max_items),
+        "format": "json",
+        "timespan": f"{max(1, int(days))}days",
+        "sort": "DateDesc",
+    }
     try:
         api_rate_limiter.wait_if_needed()
         resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
-        
+
         # GDELT sometimes returns HTML error pages instead of JSON
-        if not resp.content or 'html' in resp.headers.get('content-type', '').lower():
+        ctype = resp.headers.get("content-type", "").lower()
+        if not resp.content or "html" in ctype:
             return []
-            
+
         data = resp.json() if resp.content else {}
-        # The JSON can expose different field names across modes; handle robustly
         raw = data.get("articles") or data.get("documents") or data.get("result") or []
         items: List[Dict[str, Any]] = []
         for e in raw:
@@ -384,7 +393,7 @@ def fetch_gdelt_news(query_text: str, days: int = 30, max_items: int = 20) -> Li
                 })
         return _dedup_by_link(items, max_items)
     except Exception as e:
-        log(f"Error fetching GDELT news: {e}")
+        log(f"Error fetching GDELT news: {e}", False)
         return []
 
 
@@ -547,6 +556,7 @@ def fetch_finnhub_prices(ticker: str, days: int = 7, interval: str = "5m") -> Di
         return {}
 
 
+
 def fetch_alpha_vantage_intraday(ticker: str, interval: str = "5min") -> Dict[str, Any]:
     """Alpha Vantage intraday (requires ALPHAVANTAGE_API_KEY). Docs: https://www.alphavantage.co/documentation/"""
     api_key = os.getenv("ALPHAVANTAGE_API_KEY")
@@ -590,21 +600,108 @@ def fetch_alpha_vantage_intraday(ticker: str, interval: str = "5min") -> Dict[st
         log(f"Error fetching AlphaVantage prices for {ticker}: {e}")
         return {}
 
+# --- Yahoo Finance fallback (no API key) ---
+
+def fetch_yahoo_chart_prices(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
+    """Fallback intraday prices via Yahoo Finance v8 chart endpoint (no API key).
+    Builds 5-minute candles for the requested range and returns the same
+    structure as other providers so downstream code continues to work.
+    """
+    # Yahoo uses '-' for class shares (e.g., BRK-B), similar to Polygon/Finnhub
+    symbol = ticker.replace(".", "-")
+
+    # Yahoo allowed ranges for intraday: up to ~60d with 5m/15m/60m
+    if days <= 7:
+        range_str = "7d"
+    elif days <= 30:
+        range_str = "30d"
+    elif days <= 60:
+        range_str = "60d"
+    else:
+        range_str = "1y"  # degrade gracefully
+
+    # Validate interval – default to 5m else 60m
+    valid_intervals = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d"}
+    yf_interval = interval if interval in valid_intervals else "60m"
+
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?"
+        f"range={range_str}&interval={yf_interval}&events=history"
+    )
+
+    try:
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        chart = data.get("chart", {})
+        results = chart.get("result") or []
+        if not results:
+            return {}
+        result = results[0]
+        ts_list = result.get("timestamp") or []
+        ind = (result.get("indicators") or {}).get("quote") or [{}]
+        q = ind[0] if ind else {}
+
+        opens = q.get("open", [])
+        highs = q.get("high", [])
+        lows = q.get("low", [])
+        closes = q.get("close", [])
+        vols = q.get("volume", [])
+
+        points: List[Dict[str, Any]] = []
+        n = min(len(ts_list), len(closes))
+        for i in range(n):
+            ts = ts_list[i]
+            try:
+                iso_ts = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+            except Exception:
+                continue
+            points.append({
+                "timestamp": iso_ts,
+                "open": float(opens[i]) if i < len(opens) and opens[i] is not None else None,
+                "high": float(highs[i]) if i < len(highs) and highs[i] is not None else None,
+                "low": float(lows[i]) if i < len(lows) and lows[i] is not None else None,
+                "close": float(closes[i]) if i < len(closes) and closes[i] is not None else None,
+                "volume": int(vols[i]) if i < len(vols) and vols[i] is not None else None,
+            })
+
+        stats = _price_points_stats(points)
+        if not stats:
+            return {}
+        return {"symbol": symbol, "interval": yf_interval, "provider": "yahoo", "stats": stats, "points": points[-100:]}
+    except Exception:
+        return {}
+
 
 def fetch_price_data(ticker: str, days: int = 7, interval: str = "5m") -> Dict[str, Any]:
-    """Unified price fetch with provider fallback (Polygon -> Finnhub -> AlphaVantage)."""
+    """Unified price fetch with provider fallback.
+    Order: Polygon -> Finnhub -> AlphaVantage -> Yahoo (no key).
+    Returns a dict with keys: symbol, interval, stats, points, and provider.
+    """
     # Try Polygon intraday
     data = fetch_polygon_prices(ticker, days, interval)
     if data:
+        data.setdefault("provider", "polygon")
         return data
+
     # Try Finnhub intraday
     data = fetch_finnhub_prices(ticker, days, interval)
     if data:
+        data.setdefault("provider", "finnhub")
         return data
+
     # Try AlphaVantage intraday
     data = fetch_alpha_vantage_intraday(ticker, interval="5min")
     if data:
+        data.setdefault("provider", "alphavantage")
         return data
+
+    # Final fallback: Yahoo chart API (no API key required)
+    data = fetch_yahoo_chart_prices(ticker, days, interval)
+    if data:
+        data.setdefault("provider", "yahoo")
+        return data
+
     return {}
 
 # ----------------------
@@ -614,7 +711,7 @@ def fetch_price_data(ticker: str, days: int = 7, interval: str = "5m") -> Dict[s
 class LMStudioClient:
     """Client for LM Studio server using lmstudio SDK."""
     
-    def __init__(self, server_host: str, verbose: bool = False, timeout: float = 60.0):
+    def __init__(self, server_host: str, verbose: bool = False, timeout: float = 120.0):
         host = normalize_server_host(server_host)
         lms.configure_default_client(host)
         self.model = lms.llm()
