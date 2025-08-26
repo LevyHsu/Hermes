@@ -56,6 +56,13 @@ NEWS_REQUEST_TIMEOUT = 10.0  # Timeout for each RSS feed request (seconds)
 NEWS_CYCLE_BUDGET = 20.0  # Time budget per minute for news harvesting (seconds)
 NEWS_VERBOSE = True  # Enable detailed logging for news harvester
 
+# Smart scheduling settings
+ENABLE_SMART_SCHEDULING = True  # Enable adaptive time allocation based on news volume
+NEWS_CHECK_TIMEOUT = 5.0  # Time for quick news availability check (seconds)
+MIN_HARVEST_TIME = 10.0  # Minimum time for news harvesting (seconds)
+MAX_HARVEST_TIME = 25.0  # Maximum time for news harvesting (seconds)
+EXTENDED_LLM_TIME = 30.0  # Minimum LLM time when no news (seconds)
+
 # =====================================================================
 # LLM CONFIGURATION
 # =====================================================================
@@ -73,8 +80,8 @@ LLM_VERBOSE = True  # Enable detailed logging for LLM
 # =====================================================================
 
 # Confidence thresholds for logging trades
-HIGH_CONFIDENCE_THRESHOLD = 70  # Log trades with confidence >= this value
-REVISED_CONFIDENCE_THRESHOLD = 50  # Log trades with revised confidence >= this value
+HIGH_CONFIDENCE_THRESHOLD = 80  # Log trades with confidence >= this value
+REVISED_CONFIDENCE_THRESHOLD = 70  # Log trades with revised confidence >= this value
 
 # =====================================================================
 # LOGGING CONFIGURATION
@@ -235,6 +242,18 @@ Configuration Priority:
         type=float,
         default=NEWS_CYCLE_BUDGET,
         help=f'Time budget per minute for news harvesting (default: {NEWS_CYCLE_BUDGET})'
+    )
+    news.add_argument(
+        '--smart-scheduling',
+        action='store_true',
+        default=ENABLE_SMART_SCHEDULING,
+        help='Enable smart scheduling based on news volume'
+    )
+    news.add_argument(
+        '--no-smart-scheduling',
+        dest='smart_scheduling',
+        action='store_false',
+        help='Disable smart scheduling'
     )
     
     # LLM options

@@ -429,12 +429,21 @@ def find_latest_news_file() -> Optional[Path]:
         return news_files[-1]
     return None
 
-def run_minute_cycle(args, minute_num: int):
+def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1):
     """
-    Run one complete minute cycle:
-    1. Harvest news
-    2. Process with LLM
-    3. Log results
+    Run one complete minute cycle with smart scheduling:
+    1. Quick check of news availability (5 seconds)
+    2. Adaptive time allocation based on news volume
+    3. Harvest news with allocated time
+    4. Process with LLM using remaining time
+    
+    Args:
+        args: Command line arguments
+        minute_num: Current minute counter
+        previous_news_count: Number of news items from previous cycle
+        
+    Returns:
+        Number of news items processed in this cycle
     """
     start_time = datetime.now()
     logging.debug(f"Starting minute cycle {minute_num}")
@@ -446,27 +455,90 @@ def run_minute_cycle(args, minute_num: int):
         run_fetch_listings(args)
         if not (LISTING_DIR / "us-listings-latest.json").exists():
             logging.error("Failed to download listings - skipping cycle")
-            return
+            return 0
     
-    # Step 1: Harvest news (runs for ~20 seconds)
-    logging.debug("Starting news harvest...")
-    news_file = run_news_harvester(args, timeout_seconds=args.news_budget)
+    # Step 0: Smart scheduling - Quick news check (5 seconds max)
+    harvest_time = args.news_budget
+    estimated_news = -1
+    
+    if getattr(args, 'smart_scheduling', True):  # Default to True if not set
+        try:
+            from news_checker import get_smart_schedule
+            
+            logging.debug("Checking news availability for smart scheduling...")
+            schedule = get_smart_schedule(
+                previous_news_count=previous_news_count,
+                verbose=args.verbose
+            )
+            
+            harvest_time = schedule['harvest_time']
+            estimated_news = schedule['estimated_news']
+            
+            logging.info(f"Smart schedule: {estimated_news} estimated news items, "
+                        f"allocating {harvest_time:.0f}s for harvest, "
+                        f"{schedule['llm_time']:.0f}s for LLM")
+            
+            # Adjust timeouts based on smart schedule
+            if estimated_news == 0 and previous_news_count <= 0:
+                # Really nothing to process - quick cycle
+                logging.info("No news expected and no previous batch - quick cycle")
+                harvest_time = 5.0
+            elif estimated_news == 0 and previous_news_count > 0:
+                # No new news but have previous batch - give LLM more time
+                logging.info(f"No new news but {previous_news_count} items from previous cycle - extending LLM time")
+                harvest_time = 10.0
+                
+        except Exception as e:
+            logging.debug(f"Smart scheduling failed: {e}, using defaults")
+            harvest_time = args.news_budget
+            estimated_news = -1
+    else:
+        logging.debug("Smart scheduling disabled - using fixed time allocation")
+    
+    # Step 1: Harvest news with adaptive timeout
+    logging.debug(f"Starting news harvest with {harvest_time:.0f}s timeout...")
+    news_file = run_news_harvester(args, timeout_seconds=harvest_time)
     
     if not news_file:
         # Try to find the latest file that was created
         news_file = find_latest_news_file()
         if not news_file:
             logging.warning("No news file generated or found")
-            return
+            return 0
     
-    logging.info(f"News harvested: {news_file.name}")
+    # Count actual news items harvested
+    actual_news_count = 0
+    try:
+        with open(news_file, 'r') as f:
+            news_data = json.load(f)
+            actual_news_count = len(news_data) if isinstance(news_data, list) else 0
+    except:
+        pass
     
-    # Step 2: Process with LLM (with timeout)
+    logging.info(f"News harvested: {news_file.name} ({actual_news_count} items, estimated was {estimated_news})")
+    
+    # Step 2: Process with LLM (with adaptive timeout)
     logging.debug("Starting LLM processing...")
     
-    # Calculate remaining time in minute
+    # Calculate remaining time in minute with smart allocation
     elapsed = (datetime.now() - start_time).total_seconds()
-    remaining = max(10, 60 - elapsed)  # At least 10 seconds, up to rest of minute
+    
+    # If we have very few or no news, give LLM more time
+    if actual_news_count == 0:
+        # No news at all - give LLM maximum time if there's a previous batch
+        if previous_news_count > 0:
+            remaining = max(30, 60 - elapsed)  # At least 30 seconds
+            logging.info(f"No new news - giving LLM {remaining:.0f}s to process previous batch thoroughly")
+        else:
+            remaining = 10  # Nothing to process, quick timeout
+    elif actual_news_count <= 3:
+        # Very few items - give LLM extra time
+        remaining = max(25, 60 - elapsed)
+        logging.info(f"Only {actual_news_count} news items - extending LLM timeout to {remaining:.0f}s")
+    else:
+        # Normal allocation
+        remaining = max(10, 60 - elapsed)
+    
     llm_timeout = min(args.llm_timeout, remaining)
     
     results = run_llm_processor(news_file, args, timeout_seconds=llm_timeout)
@@ -488,6 +560,9 @@ def run_minute_cycle(args, minute_num: int):
         logging.info(f"Cycle {minute_num} complete: {total_decisions} decisions, {high_conf} high confidence")
     else:
         logging.warning(f"No LLM results for cycle {minute_num}")
+    
+    # Return the actual news count for tracking
+    return actual_news_count
 
 def sleep_until_next_minute():
     """Sleep until the start of the next minute"""
@@ -684,6 +759,8 @@ def main():
     
     minute_counter = 0
     last_listing_update = None
+    previous_news_count = -1  # Track news count from previous cycle
+    recent_news_counts = []  # Track recent cycles for trend analysis
     
     # Main loop
     while not STOP:
@@ -708,11 +785,25 @@ def main():
                         sleep_until_next_minute()
                         continue
             
-            # Run the minute cycle (news + LLM)
+            # Run the minute cycle (news + LLM) with smart scheduling
             if is_market_hours() or not args.dry_run:
-                run_minute_cycle(args, minute_counter)
+                news_count = run_minute_cycle(args, minute_counter, previous_news_count)
+                
+                # Track news counts for trend analysis
+                previous_news_count = news_count
+                recent_news_counts.append(news_count)
+                
+                # Keep only last 10 cycles for trend
+                if len(recent_news_counts) > 10:
+                    recent_news_counts.pop(0)
+                
+                # Log trend if interesting
+                if minute_counter % 5 == 0 and recent_news_counts:
+                    avg_news = sum(recent_news_counts) / len(recent_news_counts)
+                    logging.info(f"News trend: Last {len(recent_news_counts)} cycles averaged {avg_news:.1f} items/cycle")
             else:
                 logging.debug(f"Outside market hours - cycle {minute_counter} skipped")
+                previous_news_count = 0  # Reset when market closed
             
             # Health check every N minutes
             if minute_counter % 5 == 0:
