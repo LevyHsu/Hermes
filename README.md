@@ -1,305 +1,215 @@
-# IBKR-BOT 🤖📈
+# IBKR-BOT
 
-An intelligent trading signal generator that harvests financial news, analyzes it with LLM, and generates actionable trading signals with confidence scores.
+AI-powered trading signal system that harvests financial news, analyzes it with LLM, and generates real-time trading decisions.
 
-## ⚠️ Disclaimer
+## Features
 
-**This software is for educational and research purposes only. It is NOT financial advice. Always perform your own due diligence before making any trading decisions. The authors assume no responsibility for financial losses incurred through the use of this software.**
+- **Real-time News Harvesting**: Processes 60+ RSS feeds every minute
+- **LLM Analysis**: Uses local LLM (via LM Studio) for structured trading decisions
+- **Smart Scheduling**: Adaptive time allocation based on news volume
+- **Graceful Shutdown**: Proper process management with Ctrl+C support
+- **No API Keys Required**: Uses only free data sources (RSS feeds, Yahoo Finance)
 
-## 🎯 Features
+## Quick Start
 
-- **Real-time News Harvesting**: Collects news from 60+ RSS feeds every minute
-- **LLM-Powered Analysis**: Uses local LLM (via LM Studio) to analyze news impact on stocks
-- **Smart Scheduling**: Dynamically adjusts processing time based on news volume
-- **Trading Signals**: Generates BUY/SELL signals with confidence scores (0-100%)
-- **Price Enrichment**: Fetches real-time price data from Yahoo Finance
-- **Comprehensive Logging**: Tracks all decisions in multiple specialized log files
-- **Market-Aware**: Updates stock listings daily before market open
+### 1. Setup Environment
 
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Python 3.9+ (uses `zoneinfo`)
-- [LM Studio](https://lmstudio.ai/) installed and running
-- Internet connection for news and price data
-
-### Installation
-
-1. Clone the repository:
 ```bash
+# Clone repository
 git clone https://github.com/yourusername/IBKR-BOT.git
 cd IBKR-BOT
-```
 
-2. Create virtual environment:
-```bash
+# Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
 
-3. Install dependencies:
-```bash
+# Install dependencies
 pip install lmstudio requests feedparser readability-lxml beautifulsoup4 lxml
 ```
 
-4. Set environment variables:
+### 2. Configure LM Studio
+
+1. Download and install [LM Studio](https://lmstudio.ai/)
+2. Load a model (recommended: Mistral, Llama, or similar)
+3. Start the server (default: `http://localhost:1234`)
+
+### 3. Run the System
+
 ```bash
-# Required: Set your email for SEC API access
-export SEC_USER_AGENT="YourBot/1.0 (your-email@example.com)"
-
-# Optional: Set LM Studio server if not on localhost
-export LMSTUDIO_SERVER_HOST="192.168.1.100:1234"
-```
-
-5. Start LM Studio and load a model
-
-6. Run the bot:
-```bash
+# Main orchestrator (runs all components)
 python main.py
+
+# Or run components individually:
+python fetch_us_listings.py  # Fetch stock listings (daily)
+python news_feed.py -v       # Start news harvester
+python llm.py -v             # Start LLM processor
 ```
 
-## 📊 System Architecture
+### 4. Monitor Output
 
-```mermaid
-graph TD
-    A[RSS Feeds] -->|Every minute| B[News Harvester]
-    B --> C[News JSON Files]
-    C --> D[LLM Processor]
-    E[Stock Listings] --> D
-    F[Yahoo Finance] --> D
-    D --> G[Trading Signals]
-    G --> H[Log Files]
-    
-    I[NASDAQ/SEC APIs] -->|Daily| E
-    J[LM Studio Server] --> D
+- **Trading Signals**: `data/trade-log/TRADE_LOG.jsonl`
+- **Processed News**: `data/llm/<minute>/<news_id>.json`
+- **System Logs**: `logs/main_YYYYMMDD.log`
+
+## System Architecture
+
+```
+┌─────────────────┐
+│  Main Process   │
+│   (main.py)     │
+└────────┬────────┘
+         │
+    ┌────┴─────────────────┬──────────────────┐
+    ▼                       ▼                  ▼
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│Stock Listings│   │News Harvester│   │LLM Decision  │
+│  Fetcher     │   │(news_feed.py)│   │   Engine     │
+└──────────────┘   └──────────────┘   └──────────────┘
+    │                   │                   │
+    ▼                   ▼                   ▼
+[us-listings.json] [news/*.json]    [trade signals]
 ```
 
-## 🔧 Configuration
+## Configuration
 
-All settings are centralized in `args.py`:
+Edit `args.py` to customize:
 
-### Key Settings
+```python
+# Confidence thresholds
+confidence_threshold = 80      # Primary signal threshold
+confidence_low_threshold = 70  # Secondary signal threshold
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `HIGH_CONFIDENCE_THRESHOLD` | 80% | Minimum confidence for high-confidence trades |
-| `REVISED_CONFIDENCE_THRESHOLD` | 70% | Minimum confidence after enrichment |
-| `LLM_TIMEOUT` | 120s | Maximum time for LLM processing |
-| `NEWS_CYCLE_BUDGET` | 20s | Time allocated for news harvesting |
-| `ENABLE_SMART_SCHEDULING` | True | Adaptive time allocation |
+# Time allocation (smart scheduling)
+min_harvest_time = 10.0        # Minimum news harvest time
+max_harvest_time = 25.0        # Maximum news harvest time
+total_cycle_time = 55.0        # Total cycle (60s - 5s buffer)
 
-### Command Line Options
+# Server settings
+server_host = "localhost:1234" # LM Studio server
+```
+
+## Command Line Options
 
 ```bash
-# Run with custom settings
-python main.py --llm-host 192.168.1.100:1234 --high-confidence 75
+python main.py [options]
 
-# Clean all data and logs
-python main.py -c
-
-# Disable smart scheduling
-python main.py --no-smart-scheduling
-
-# Run in verbose mode
-python main.py --verbose
+Options:
+  -v, --verbose         Enable verbose logging
+  -d, --dry-run        Test mode (no actual trades)
+  -c, --clean          Clean all data/logs before starting
+  --force-clean        Clean without confirmation
+  --confidence N       Set confidence threshold (default: 80)
+  --server-host HOST   LM Studio server (default: localhost:1234)
 ```
 
-## 📁 Project Structure
+## Data Structure
 
 ```
 IBKR-BOT/
-├── main.py                 # Main orchestrator
-├── args.py                 # Centralized configuration
-├── news_harvester.py       # Single-cycle news fetcher
-├── news_feed.py           # Continuous RSS harvester
-├── llm.py                 # LLM decision engine
-├── news_checker.py        # Smart scheduling optimizer
-├── fetch_us_listings.py   # Stock listings updater
 ├── data/
-│   ├── news/              # Minute-bucketed news (YYMMDDHHMM.json)
-│   ├── result/            # LLM processing results
-│   └── us-stock-listing/  # Daily stock listings
-└── logs/
-    ├── detailed.log              # Complete system log
-    ├── simple.log                # Summary log
-    ├── high_confidence_trades.log    # Trades ≥80% confidence
-    └── revised_confidence_trades.log # Trades ≥70% after enrichment
+│   ├── news/              # Raw news (YYMMDDHHMM.json)
+│   ├── llm/               # LLM decisions by minute
+│   ├── trade-log/         # Trading signals (TRADE_LOG.jsonl)
+│   └── us-stock-listing/  # Stock universe
+├── logs/                  # System logs
+├── doc/                   # Documentation
+└── test/                  # Test suites
 ```
 
-## 🧠 Smart Scheduling
+## Trading Signal Format
 
-The system dynamically adjusts time allocation based on news volume:
-
-| News Volume | Harvest Time | LLM Time | Strategy |
-|------------|--------------|----------|----------|
-| 0 items | 5s | 50s | Quick check, maximum analysis |
-| 1-3 items | 10s | 45s | Light harvest, extended analysis |
-| 4-10 items | 15s | 40s | Balanced allocation |
-| 11-20 items | 20s | 35s | Standard harvest |
-| 20+ items | 25s | 30s | Maximum harvest |
-
-## 📈 Trading Signals
-
-Each signal includes:
-- **Ticker**: Stock symbol
-- **Action**: BUY or SELL
-- **Confidence**: Initial confidence (0-100%)
-- **Revised Confidence**: After enrichment with additional data
-- **Expected Price**: Target price prediction
-- **Horizon**: Timeframe in hours
-- **Reasoning**: Detailed explanation
-
-Example signal (JSON):
 ```json
 {
+  "timestamp": "2024-12-19T10:30:00Z",
   "ticker": "AAPL",
   "action": "BUY",
   "confidence": 85,
-  "revised_confidence": 92,
-  "expected_price": 185.50,
-  "horizon_hours": 24,
-  "reason": "Strong iPhone sales data with positive analyst upgrades...",
-  "news_title": "Apple Reports Record Q4 Revenue",
-  "news_link": "https://...",
-  "news_time": "2024-01-15T14:30:00Z"
+  "reason": "Strong iPhone sales data with analyst upgrades...",
+  "news_id": "abc123",
+  "expected_high_price": 185.50,
+  "horizon_hours": 24
 }
 ```
 
-## 📰 News Sources
+## Testing
 
-The bot monitors 60+ RSS feeds including:
-- Bloomberg
-- Wall Street Journal
-- Financial Times
-- MarketWatch
-- Reuters
-- CNBC
-- Yahoo Finance
-- SEC Filings
-- Federal Reserve
-- Company press releases
-
-## 🔍 Monitoring
-
-### View Real-time Activity
 ```bash
-# Watch main activity
-tail -f logs/simple.log
+# Run all tests
+for test in test/test_*.py; do python "$test"; done
 
-# Monitor high-confidence trades
-tail -f logs/high_confidence_trades.log
-
-# Check for errors
-grep ERROR logs/detailed.log | tail -20
+# Individual tests
+python test/test_shutdown.py         # Test graceful shutdown
+python test/test_smart_scheduling.py # Test time allocation
+python test/test_refined_reason.py   # Test LLM truncation
+python test/test_listing_logic.py    # Test stock listings
 ```
 
-### Extract Trading Signals
+## Documentation
+
+- [Complete Usage Guide](doc/MAIN_USAGE.md)
+- [Smart Scheduling Details](doc/SMART_SCHEDULING.md)
+- [Shutdown Implementation](doc/SHUTDOWN_FIX.md)
+- [Claude AI Instructions](doc/CLAUDE.md)
+
+## Safety Features
+
+- **Graceful Shutdown**: Clean process termination with Ctrl+C
+- **Smart Scheduling**: Adaptive processing based on workload
+- **Database Preservation**: Clean flag preserves critical databases
+- **Confirmation Prompts**: Destructive operations require confirmation
+- **Process Monitoring**: Automatic cleanup of zombie processes
+
+## Requirements
+
+- Python 3.9+ (uses zoneinfo)
+- LM Studio with loaded model
+- 4GB+ RAM recommended
+- Stable internet connection
+
+## Troubleshooting
+
+### LM Studio Connection Failed
 ```bash
-# Today's high-confidence trades
-grep "$(date +%Y-%m-%d)" logs/high_confidence_trades.log | jq '.'
-
-# Count trades by action
-grep "$(date +%Y-%m-%d)" logs/high_confidence_trades.log | jq -r '.action' | sort | uniq -c
-```
-
-## 🐛 Troubleshooting
-
-### LM Studio Connection Issues
-```bash
-# Test connection
-curl http://localhost:1234/health
-
-# Check if model is loaded
+# Check if server is running
 curl http://localhost:1234/v1/models
+
+# Use custom host
+python main.py --server-host 192.168.1.100:1234
 ```
 
 ### Missing Stock Listings
 ```bash
-# Manually update listings
-python fetch_us_listings.py --force
+# Force re-download
+rm -rf data/us-stock-listing/*
+python fetch_us_listings.py
 ```
 
-### News Harvesting Issues
+### Process Won't Stop
 ```bash
-# Test harvester standalone
-python news_harvester.py -v
-
-# Check seen database
-sqlite3 data/news/.seen.db "SELECT COUNT(*) FROM seen;"
+# Emergency kill
+pkill -9 -f "python.*main.py"
+pkill -9 -f "python.*news_feed.py"
+pkill -9 -f "python.*llm.py"
 ```
 
-## 🚢 Production Deployment
+## Contributing
 
-### Using systemd (Linux)
-
-1. Create service file `/etc/systemd/system/ibkr-bot.service`:
-```ini
-[Unit]
-Description=IBKR Trading Bot
-After=network.target
-
-[Service]
-Type=simple
-User=youruser
-WorkingDirectory=/path/to/IBKR-BOT
-Environment="SEC_USER_AGENT=YourBot/1.0 (your@email.com)"
-ExecStart=/path/to/venv/bin/python /path/to/IBKR-BOT/main.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-2. Enable and start:
-```bash
-sudo systemctl enable ibkr-bot
-sudo systemctl start ibkr-bot
-```
-
-### Using Docker
-
-```dockerfile
-FROM python:3.9-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-CMD ["python", "main.py"]
-```
-
-## 📊 Performance
-
-- **News Processing**: ~1000 articles/hour
-- **LLM Analysis**: 10-50 decisions/minute
-- **Memory Usage**: ~200MB
-- **CPU Usage**: 5-15% (single core)
-- **Network**: ~10MB/hour
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
 1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Open a Pull Request
+2. Create feature branch (`git checkout -b feature/amazing`)
+3. Commit changes (`git commit -m 'Add amazing feature'`)
+4. Push to branch (`git push origin feature/amazing`)
+5. Open Pull Request
 
-## 📝 License
+## License
 
-MIT License - see [LICENSE](LICENSE) file for details
+MIT License - see LICENSE file for details
 
-## 🙏 Acknowledgments
+## Disclaimer
 
-- [LM Studio](https://lmstudio.ai/) for local LLM inference
-- [Yahoo Finance](https://finance.yahoo.com/) for price data
-- All news providers for RSS feeds
-- SEC for company data APIs
+This software is for educational purposes only. Not financial advice. Use at your own risk. Always verify signals before trading.
 
-## 📮 Contact
+## Support
 
-For questions or support, please open an issue on GitHub.
-
----
-
-**Remember**: This is a research tool for educational purposes. Always verify signals before trading. Past performance does not guarantee future results.
+- Issues: [GitHub Issues](https://github.com/yourusername/IBKR-BOT/issues)
+- Documentation: [doc/](doc/)
+- Tests: [test/](test/)
