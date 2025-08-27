@@ -210,10 +210,10 @@ def get_smart_schedule(
     """
     start = time.time()
     
-    # Quick check (5 seconds max)
+    # Quick check (3 seconds max to be more responsive)
     raw_estimate, feed_counts = estimate_available_news(
         feeds_file=feeds_file,
-        max_check_time=5.0,
+        max_check_time=3.0,
         verbose=verbose
     )
     

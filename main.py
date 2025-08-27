@@ -54,6 +54,7 @@ ET_TZ = ZoneInfo("America/New_York")
 # Global stop flag and process tracking
 STOP = False
 CHILD_PROCESSES = []
+CURRENT_SUBPROCESS = None  # Track the currently running subprocess
 
 # =====================================================================
 # SIGNAL HANDLERS
@@ -82,15 +83,30 @@ def cleanup_child_processes():
 
 def handle_signal(signum, frame):
     """Handle shutdown signals gracefully"""
-    global STOP
+    global STOP, CURRENT_SUBPROCESS
     STOP = True
-    logging.info(f"Received signal {signum}, shutting down gracefully...")
+    
+    # Only log if logging is configured
+    try:
+        logging.info(f"Received signal {signum}, shutting down gracefully...")
+    except:
+        pass
+    
+    # Always print to stderr so user sees it
     print(f"\n[SHUTDOWN] Received signal {signum}, shutting down gracefully...", file=sys.stderr)
-    cleanup_child_processes()
+    
+    # Terminate any running subprocess immediately
+    if CURRENT_SUBPROCESS and CURRENT_SUBPROCESS.poll() is None:
+        try:
+            if os.name != 'nt':
+                os.killpg(os.getpgid(CURRENT_SUBPROCESS.pid), signal.SIGTERM)
+            else:
+                CURRENT_SUBPROCESS.terminate()
+            print(f"[SHUTDOWN] Terminating subprocess PID {CURRENT_SUBPROCESS.pid}", file=sys.stderr)
+        except:
+            pass
 
-# Register signal handlers
-for sig in (signal.SIGINT, signal.SIGTERM):
-    signal.signal(sig, handle_signal)
+# Signal handlers will be registered in main() after logging is setup
 
 # =====================================================================
 # LOGGING SETUP
@@ -276,12 +292,32 @@ def run_fetch_listings(args):
     try:
         cmd = [sys.executable, "fetch_us_listings.py", "--force"]
         
-        result = subprocess.run(
+        # Use Popen for interruptible subprocess
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=60  # 1 minute timeout
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
         )
+        
+        # Wait with timeout while checking for STOP
+        start_time = time.time()
+        while process.poll() is None and not STOP:
+            if time.time() - start_time > 60:
+                process.terminate()
+                break
+            time.sleep(0.1)
+        
+        if STOP:
+            process.terminate()
+            return
+            
+        # Create result object
+        result = process
+        stdout, stderr = process.communicate(timeout=1) if process.poll() is not None else ("", "")
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = process.returncode
         
         if result.returncode == 0:
             logging.info("Stock listings updated successfully")
@@ -302,7 +338,7 @@ def run_news_harvester(args, timeout_seconds=20):
     Run the news harvester for one minute cycle.
     Returns the path to the generated news file.
     """
-    global STOP
+    global STOP, CURRENT_SUBPROCESS
     if STOP:
         return None
         
@@ -327,9 +363,29 @@ def run_news_harvester(args, timeout_seconds=20):
             preexec_fn=os.setsid if os.name != 'nt' else None  # Create new process group
         )
         CHILD_PROCESSES.append(process)
+        CURRENT_SUBPROCESS = process
         
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds + 10)
+            # Poll with short intervals to check STOP
+            start_time = time.time()
+            while process.poll() is None:
+                if STOP:
+                    if os.name != 'nt':
+                        try:
+                            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                        except:
+                            process.terminate()
+                    else:
+                        process.terminate()
+                    CURRENT_SUBPROCESS = None
+                    return None
+                if time.time() - start_time > timeout_seconds + 10:
+                    raise subprocess.TimeoutExpired(cmd, timeout_seconds)
+                time.sleep(0.1)
+            
+            # Process finished, get output
+            stdout, stderr = process.communicate(timeout=1)
+            CURRENT_SUBPROCESS = None
             try:
                 CHILD_PROCESSES.remove(process)  # Remove from tracking after completion
             except ValueError:
@@ -359,7 +415,7 @@ def run_llm_processor(news_file: Path, args, timeout_seconds=120):
     Run the LLM processor on a news file.
     Returns the processing results or None if failed/timeout.
     """
-    global STOP
+    global STOP, CURRENT_SUBPROCESS
     if STOP:
         return None
         
@@ -387,9 +443,29 @@ def run_llm_processor(news_file: Path, args, timeout_seconds=120):
             preexec_fn=os.setsid if os.name != 'nt' else None
         )
         CHILD_PROCESSES.append(process)
+        CURRENT_SUBPROCESS = process
         
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            # Poll with short intervals to check STOP
+            start_time = time.time()
+            while process.poll() is None:
+                if STOP:
+                    if os.name != 'nt':
+                        try:
+                            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                        except:
+                            process.terminate()
+                    else:
+                        process.terminate()
+                    CURRENT_SUBPROCESS = None
+                    return None
+                if time.time() - start_time > timeout_seconds:
+                    raise subprocess.TimeoutExpired(cmd, timeout_seconds)
+                time.sleep(0.1)
+            
+            # Process finished, get output
+            stdout, stderr = process.communicate(timeout=1)
+            CURRENT_SUBPROCESS = None
             try:
                 CHILD_PROCESSES.remove(process)  # Remove from tracking after completion
             except ValueError:
@@ -532,7 +608,7 @@ def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1, recen
     harvest_time = args.news_budget
     estimated_news = -1
     
-    if getattr(args, 'smart_scheduling', True):  # Default to True if not set
+    if getattr(args, 'smart_scheduling', True) and not STOP:  # Default to True if not set
         try:
             from news_checker import get_smart_schedule
             
@@ -661,12 +737,16 @@ def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1, recen
     return actual_news_count, llm_timed_out
 
 def sleep_until_next_minute():
-    """Sleep until the start of the next minute"""
+    """Sleep until the start of the next minute with interrupt checking"""
+    global STOP
     now = datetime.now()
     next_minute = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
     sleep_seconds = (next_minute - now).total_seconds()
     if sleep_seconds > 0:
-        time.sleep(sleep_seconds)
+        # Sleep in small increments to check for STOP
+        sleep_start = time.time()
+        while not STOP and (time.time() - sleep_start) < sleep_seconds:
+            time.sleep(0.1)  # Check every 100ms
 
 def clean_data_and_logs(args, force=False):
     """
@@ -799,6 +879,13 @@ def main():
     # Parse arguments
     args = get_args()
     
+    # Register signal handlers early (before any operations)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handle_signal)
+        except Exception as e:
+            print(f"Warning: Could not register signal {sig}: {e}")
+    
     # Handle clean operation
     if args.clean or args.force_clean:
         print("Starting clean operation...")
@@ -866,8 +953,12 @@ def main():
             minute_counter += 1
             cycle_start = datetime.now()
             
+            # Check for early shutdown
+            if STOP:
+                break
+                
             # Check if we should update listings (includes emergency check for missing listings)
-            if should_update_listings():
+            if should_update_listings() and not STOP:
                 today = get_et_now().date()
                 if last_listing_update != today or not (LISTING_DIR / "us-listings-latest.json").exists():
                     if not (LISTING_DIR / "us-listings-latest.json").exists():
@@ -929,11 +1020,18 @@ def main():
             logging.info("Keyboard interrupt received - shutting down...")
             break
         except Exception as e:
+            if STOP:
+                # If we're stopping, don't log errors
+                break
             logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
             if not args.retry_failures:
                 break
             logging.info("Retrying in 10 seconds...")
-            time.sleep(10)
+            # Interruptible sleep
+            for _ in range(100):
+                if STOP:
+                    break
+                time.sleep(0.1)
     
     # Shutdown
     logging.info("="*60)
