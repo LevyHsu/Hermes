@@ -500,7 +500,7 @@ def find_latest_news_file() -> Optional[Path]:
         return news_files[-1]
     return None
 
-def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1):
+def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1, recent_timeouts: int = 0):
     """
     Run one complete minute cycle with smart scheduling:
     1. Quick check of news availability (5 seconds)
@@ -539,7 +539,8 @@ def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1):
             logging.debug("Checking news availability for smart scheduling...")
             schedule = get_smart_schedule(
                 previous_news_count=previous_news_count,
-                verbose=args.verbose
+                verbose=args.verbose,
+                recent_timeouts=recent_timeouts
             )
             
             harvest_time = schedule['harvest_time']
@@ -588,6 +589,15 @@ def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1):
     
     logging.info(f"News harvested: {news_file.name} ({actual_news_count} items, estimated was {estimated_news})")
     
+    # Track estimation accuracy if using smart scheduler
+    scheduler = None
+    if estimated_news >= 0:
+        try:
+            from smart_scheduler import SmartScheduler
+            scheduler = SmartScheduler()
+        except ImportError:
+            pass
+    
     # Step 2: Process with LLM (with adaptive timeout)
     logging.debug("Starting LLM processing...")
     
@@ -613,6 +623,7 @@ def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1):
     llm_timeout = min(args.llm_timeout, remaining)
     
     results = run_llm_processor(news_file, args, timeout_seconds=llm_timeout)
+    llm_timed_out = (results is None)  # None indicates timeout
     
     if results:
         logging.info(f"LLM processed {len(results)} news items")
@@ -629,11 +640,25 @@ def run_minute_cycle(args, minute_num: int, previous_news_count: int = -1):
         )
         
         logging.info(f"Cycle {minute_num} complete: {total_decisions} decisions, {high_conf} high confidence")
+        llm_success = True
     else:
         logging.warning(f"No LLM results for cycle {minute_num}")
+        llm_success = False
     
-    # Return the actual news count for tracking
-    return actual_news_count
+    # Record estimation accuracy for learning
+    if scheduler and estimated_news >= 0:
+        cycle_duration = (datetime.now() - start_time).total_seconds()
+        scheduler.record_estimation(
+            estimated=estimated_news,
+            actual=actual_news_count,
+            harvest_time=harvest_time,
+            llm_time=llm_timeout,
+            cycle_duration=cycle_duration,
+            llm_success=llm_success
+        )
+    
+    # Return actual news count and timeout status for tracking
+    return actual_news_count, llm_timed_out
 
 def sleep_until_next_minute():
     """Sleep until the start of the next minute"""
@@ -833,6 +858,7 @@ def main():
     last_listing_update = None
     previous_news_count = -1  # Track news count from previous cycle
     recent_news_counts = []  # Track recent cycles for trend analysis
+    recent_timeouts = 0  # Track recent LLM timeouts for adaptive scheduling
     
     # Main loop
     while not STOP:
@@ -859,7 +885,13 @@ def main():
             
             # Run the minute cycle (news + LLM) with smart scheduling
             if is_market_hours() or not args.dry_run:
-                news_count = run_minute_cycle(args, minute_counter, previous_news_count)
+                news_count, timed_out = run_minute_cycle(args, minute_counter, previous_news_count, recent_timeouts)
+                
+                # Update timeout tracking
+                if timed_out:
+                    recent_timeouts = min(recent_timeouts + 1, 5)  # Cap at 5 for stability
+                else:
+                    recent_timeouts = max(0, recent_timeouts - 1)  # Decay on success
                 
                 # Track news counts for trend analysis
                 previous_news_count = news_count

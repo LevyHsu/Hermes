@@ -186,7 +186,8 @@ def calculate_time_allocation(
 def get_smart_schedule(
     feeds_file: str = None,
     previous_news_count: int = -1,
-    verbose: bool = False
+    verbose: bool = False,
+    recent_timeouts: int = 0
 ) -> Dict[str, float]:
     """
     Get smart scheduling recommendation based on news availability.
@@ -195,6 +196,7 @@ def get_smart_schedule(
         feeds_file: Optional path to extra feeds file
         previous_news_count: Number of news items from previous cycle
         verbose: Enable verbose output
+        recent_timeouts: Number of recent LLM timeouts
         
     Returns:
         Dictionary with scheduling recommendations:
@@ -209,7 +211,7 @@ def get_smart_schedule(
     start = time.time()
     
     # Quick check (5 seconds max)
-    estimated_news, feed_counts = estimate_available_news(
+    raw_estimate, feed_counts = estimate_available_news(
         feeds_file=feeds_file,
         max_check_time=5.0,
         verbose=verbose
@@ -217,19 +219,47 @@ def get_smart_schedule(
     
     check_time = time.time() - start
     
-    # Calculate time allocation
-    harvest_time, llm_time = calculate_time_allocation(
-        estimated_news=estimated_news,
-        previous_cycle_news=previous_news_count
-    )
-    
-    # Determine confidence in estimate
-    if check_time < 2.0 and len(feed_counts) > 10:
-        confidence = 'high'
-    elif check_time < 4.0 and len(feed_counts) > 5:
-        confidence = 'medium'
-    else:
-        confidence = 'low'
+    # Try to use enhanced scheduler if available
+    try:
+        from smart_scheduler import integrate_smart_scheduler
+        enhanced = integrate_smart_scheduler(
+            raw_estimate, 
+            previous_news_count,
+            recent_timeouts,
+            verbose
+        )
+        
+        estimated_news = enhanced['estimated_news']
+        harvest_time = enhanced['harvest_time']
+        llm_time = enhanced['llm_time']
+        
+        # Convert confidence percentage to high/medium/low
+        conf_pct = enhanced.get('confidence', 0)
+        if conf_pct > 0.7:
+            confidence = 'high'
+        elif conf_pct > 0.4:
+            confidence = 'medium'
+        else:
+            confidence = 'low'
+            
+        if verbose and raw_estimate != estimated_news:
+            print(f"[smart_schedule] Adjusted estimate: {raw_estimate} -> {estimated_news}")
+            
+    except ImportError:
+        # Fallback to original calculation
+        estimated_news = raw_estimate
+        harvest_time, llm_time = calculate_time_allocation(
+            estimated_news=estimated_news,
+            previous_cycle_news=previous_news_count
+        )
+        
+        # Determine confidence in estimate
+        if check_time < 2.0 and len(feed_counts) > 10:
+            confidence = 'high'
+        elif check_time < 4.0 and len(feed_counts) > 5:
+            confidence = 'medium'
+        else:
+            confidence = 'low'
     
     schedule = {
         'estimated_news': estimated_news,
@@ -237,7 +267,8 @@ def get_smart_schedule(
         'llm_time': llm_time,
         'check_time': check_time,
         'confidence': confidence,
-        'active_feeds': len(feed_counts)
+        'active_feeds': len(feed_counts),
+        'raw_estimate': raw_estimate
     }
     
     if verbose:
