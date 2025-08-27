@@ -51,12 +51,34 @@ except ImportError:
 
 ET_TZ = ZoneInfo("America/New_York")
 
-# Global stop flag
+# Global stop flag and process tracking
 STOP = False
+CHILD_PROCESSES = []
 
 # =====================================================================
 # SIGNAL HANDLERS
 # =====================================================================
+
+def cleanup_child_processes():
+    """Kill any remaining child processes"""
+    global CHILD_PROCESSES
+    for proc in CHILD_PROCESSES:
+        try:
+            if proc.poll() is None:  # Still running
+                if os.name != 'nt':
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except:
+                        proc.terminate()
+                else:
+                    proc.terminate()
+                proc.wait(timeout=2)
+        except:
+            try:
+                proc.kill()
+            except:
+                pass
+    CHILD_PROCESSES.clear()
 
 def handle_signal(signum, frame):
     """Handle shutdown signals gracefully"""
@@ -64,6 +86,7 @@ def handle_signal(signum, frame):
     STOP = True
     logging.info(f"Received signal {signum}, shutting down gracefully...")
     print(f"\n[SHUTDOWN] Received signal {signum}, shutting down gracefully...", file=sys.stderr)
+    cleanup_child_processes()
 
 # Register signal handlers
 for sig in (signal.SIGINT, signal.SIGTERM):
@@ -279,6 +302,10 @@ def run_news_harvester(args, timeout_seconds=20):
     Run the news harvester for one minute cycle.
     Returns the path to the generated news file.
     """
+    global STOP
+    if STOP:
+        return None
+        
     try:
         cmd = [
             sys.executable, "news_harvester.py",
@@ -291,26 +318,37 @@ def run_news_harvester(args, timeout_seconds=20):
         if args.verbose:
             cmd.append("-v")
         
-        # Run news harvester (single cycle)
-        result = subprocess.run(
+        # Run news harvester (single cycle) with proper process handling
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds + 10  # Give extra time for completion
+            preexec_fn=os.setsid if os.name != 'nt' else None  # Create new process group
         )
+        CHILD_PROCESSES.append(process)
         
-        if result.returncode == 0 and result.stdout:
-            # The script prints the file path to stdout
-            news_file = result.stdout.strip()
-            if news_file:
-                return Path(news_file)
-        else:
-            # Check stderr for errors
-            if result.stderr:
-                logging.debug(f"News harvester stderr: {result.stderr}")
-            
-    except subprocess.TimeoutExpired:
-        logging.warning("News harvester timed out")
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds + 10)
+            try:
+                CHILD_PROCESSES.remove(process)  # Remove from tracking after completion
+            except ValueError:
+                pass  # Already removed
+            if process.returncode == 0 and stdout:
+                news_file = stdout.strip()
+                if news_file:
+                    return Path(news_file)
+            else:
+                if stderr and args.verbose:
+                    logging.debug(f"News harvester stderr: {stderr}")
+        except subprocess.TimeoutExpired:
+            # Kill entire process group
+            if os.name != 'nt':
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+            process.wait(timeout=5)
+            logging.warning("News harvester timed out")
     except Exception as e:
         logging.error(f"Error running news harvester: {e}")
         
@@ -321,6 +359,10 @@ def run_llm_processor(news_file: Path, args, timeout_seconds=120):
     Run the LLM processor on a news file.
     Returns the processing results or None if failed/timeout.
     """
+    global STOP
+    if STOP:
+        return None
+        
     logging.debug(f"Processing news file: {news_file}")
     
     try:
@@ -336,27 +378,56 @@ def run_llm_processor(news_file: Path, args, timeout_seconds=120):
         if args.verbose:
             cmd.append("-v")
         
-        result = subprocess.run(
+        # Use Popen for better process control
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds
+            preexec_fn=os.setsid if os.name != 'nt' else None
         )
+        CHILD_PROCESSES.append(process)
         
-        if result.returncode == 0:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            try:
+                CHILD_PROCESSES.remove(process)  # Remove from tracking after completion
+            except ValueError:
+                pass  # Already removed
+            result_returncode = process.returncode
+            result_stdout = stdout
+            result_stderr = stderr
+        except subprocess.TimeoutExpired:
+            # Kill entire process group
+            if os.name != 'nt':
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except:
+                    process.terminate()
+            else:
+                process.terminate()
+            
+            # Give it a moment to terminate gracefully
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()  # Force kill if still running
+                process.wait()
+            
+            logging.warning(f"LLM processing timed out after {timeout_seconds}s")
+            if args.skip_timeout:
+                logging.info("Skipping to next news batch due to timeout")
+            return None
+        
+        if result_returncode == 0:
             # Read the results from the latest file
             latest_results = RESULT_DIR / "latest_results.json"
             if latest_results.exists():
                 with open(latest_results, 'r') as f:
                     return json.load(f)
         else:
-            logging.error(f"LLM processor failed: {result.stderr}")
-            
-    except subprocess.TimeoutExpired:
-        logging.warning(f"LLM processing timed out after {timeout_seconds}s")
-        if args.skip_timeout:
-            logging.info("Skipping to next news batch due to timeout")
-            return None
+            if result_stderr:
+                logging.error(f"LLM processor failed: {result_stderr}")
     except Exception as e:
         logging.error(f"Error running LLM processor: {e}")
         
@@ -811,13 +882,18 @@ def main():
             
             # Calculate time to sleep
             cycle_duration = (datetime.now() - cycle_start).total_seconds()
-            if cycle_duration < 60:
-                sleep_until_next_minute()
-            else:
+            if cycle_duration < 60 and not STOP:
+                # Sleep in small increments to be responsive to SIGINT
+                sleep_time = 60 - cycle_duration
+                sleep_start = time.time()
+                while not STOP and (time.time() - sleep_start) < sleep_time:
+                    time.sleep(0.5)  # Check every 0.5 seconds
+            elif not STOP:
                 logging.warning(f"Cycle {minute_counter} took {cycle_duration:.1f}s (>60s)")
                 
         except KeyboardInterrupt:
-            logging.info("Keyboard interrupt received")
+            STOP = True
+            logging.info("Keyboard interrupt received - shutting down...")
             break
         except Exception as e:
             logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
@@ -830,6 +906,10 @@ def main():
     logging.info("="*60)
     logging.info("IBKR-BOT SHUTTING DOWN")
     logging.info(f"Total cycles completed: {minute_counter}")
+    
+    # Final cleanup
+    cleanup_child_processes()
+    logging.info("All child processes terminated")
     logging.info("="*60)
     
     return 0
