@@ -769,6 +769,7 @@ def clean_data_and_logs(args, force=False):
 
 def main():
     """Main orchestration loop"""
+    global STOP
     
     # Parse arguments
     args = get_args()
