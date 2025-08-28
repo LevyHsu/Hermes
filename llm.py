@@ -379,7 +379,12 @@ class LMStudioClient:
     def __init__(self, server_host: str, verbose: bool = False, timeout: float = 120.0):
         host = normalize_server_host(server_host)
         lms.configure_default_client(host)
-        self.model = lms.llm()
+        # Try to use any available model - don't specify model identifier
+        try:
+            self.model = lms.llm(model_identifier="openai/gpt-oss-120b")
+        except:
+            # Fall back to default if specific model not available
+            self.model = lms.llm()
         self.host = host
         self.verbose = verbose
         self.timeout = timeout
