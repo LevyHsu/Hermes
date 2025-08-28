@@ -110,6 +110,8 @@ def harvester_thread(args):
     global STOP, NEWS_QUEUE
     
     logging.info("Harvester thread started")
+    if DASHBOARD:
+        DASHBOARD.add_console_log("Harvester thread started", "info")
     feeds = list(dict.fromkeys(DEFAULT_FEEDS + load_extra_feeds(getattr(args, 'feeds_file', None), args.verbose)))
     
     while not STOP:
@@ -157,23 +159,35 @@ def harvester_thread(args):
                         )
                         
                         if NEWS_QUEUE.add(news_item):
-                            logging.info(f"Added {minute_key} to queue: {len(items)} items in {harvest_time:.1f}s")
+                            msg = f"Added {minute_key} to queue: {len(items)} items in {harvest_time:.1f}s"
+                            logging.info(msg)
+                            if DASHBOARD:
+                                DASHBOARD.add_console_log(msg, "success")
                             
                             # Update dashboard
                             if DASHBOARD:
                                 DASHBOARD.update_queue_stats(NEWS_QUEUE.get_stats())
                         
                 except Exception as e:
-                    logging.error(f"Error processing harvested news: {e}")
+                    msg = f"Error processing harvested news: {e}"
+                    logging.error(msg)
+                    if DASHBOARD:
+                        DASHBOARD.add_console_log(msg, "error")
             else:
-                logging.debug(f"No news for {minute_key}")
+                msg = f"No news for {minute_key}"
+                logging.debug(msg)
+                if DASHBOARD:
+                    DASHBOARD.add_console_log(msg, "warning")
                 
         except Exception as e:
             logging.error(f"Harvester error: {e}")
             if not STOP:
                 time.sleep(10)  # Brief pause before retry
                 
-    logging.info("Harvester thread stopped")
+    msg = "Harvester thread stopped"
+    logging.info(msg)
+    if DASHBOARD:
+        DASHBOARD.add_console_log(msg, "info")
 
 
 def processor_thread(args):
@@ -184,6 +198,8 @@ def processor_thread(args):
     global STOP, NEWS_QUEUE, LLM_CLIENT
     
     logging.info("Processor thread started")
+    if DASHBOARD:
+        DASHBOARD.add_console_log("Processor thread started", "info")
     
     # Track performance
     items_processed = 0
@@ -203,12 +219,18 @@ def processor_thread(args):
                 
             # Check if there's something even newer
             if NEWS_QUEUE.has_newer_than(news_item.minute_key):
-                logging.info(f"Skipping {news_item.minute_key} - newer news available")
+                msg = f"Skipping {news_item.minute_key} - newer news available"
+                logging.info(msg)
+                if DASHBOARD:
+                    DASHBOARD.add_console_log(msg, "warning")
                 items_abandoned += 1
                 continue
                 
             current_processing = news_item.minute_key
-            logging.info(f"Processing {news_item.minute_key}: {news_item.item_count} items, age {news_item.age_seconds:.1f}s")
+            msg = f"Processing {news_item.minute_key}: {news_item.item_count} items, age {news_item.age_seconds:.1f}s"
+            logging.info(msg)
+            if DASHBOARD:
+                DASHBOARD.add_console_log(msg, "info")
             
             # Update dashboard
             if DASHBOARD:
@@ -262,7 +284,10 @@ def processor_thread(args):
                                     ticker = decision['ticker']
                                     action = decision['action'] 
                                     confidence = decision['confidence']
-                                    logging.info(f"HIGH CONFIDENCE: {ticker} {action} @ {confidence}%")
+                                    msg = f"HIGH CONFIDENCE: {ticker} {action} @ {confidence}%"
+                                    logging.info(msg)
+                                    if DASHBOARD:
+                                        DASHBOARD.add_console_log(msg, "success")
                                     
                                     # Add to dashboard
                                     if DASHBOARD:
@@ -282,10 +307,15 @@ def processor_thread(args):
                 # Log human-readable decisions to logs/
                 log_human_readable_decisions(results, news_item.minute_key, news_item.items)
                 
-                logging.info(f"Completed {news_item.minute_key} in {process_time:.1f}s - "
-                           f"{len(results)} items with decisions")
+                msg = f"Completed {news_item.minute_key} in {process_time:.1f}s - {len(results)} items with decisions"
+                logging.info(msg)
+                if DASHBOARD:
+                    DASHBOARD.add_console_log(msg, "info")
             else:
-                logging.warning(f"No decisions for {news_item.minute_key}")
+                msg = f"No decisions for {news_item.minute_key}"
+                logging.warning(msg)
+                if DASHBOARD:
+                    DASHBOARD.add_console_log(msg, "warning")
                 
             current_processing = None
             
@@ -295,9 +325,10 @@ def processor_thread(args):
                 time.sleep(1)
                 
     # Final stats
-    logging.info(f"Processor stopped - Processed: {items_processed}, "
-                f"Decisions: {total_decisions} ({high_conf_decisions} high conf), "
-                f"Abandoned: {items_abandoned}")
+    msg = f"Processor stopped - Processed: {items_processed}, Decisions: {total_decisions} ({high_conf_decisions} high conf), Abandoned: {items_abandoned}"
+    logging.info(msg)
+    if DASHBOARD:
+        DASHBOARD.add_console_log(msg, "info")
 
 
 def process_single_news_item(item: Dict, llm_client, confidence_threshold: float, 

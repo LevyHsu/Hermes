@@ -31,6 +31,7 @@ class StatusDashboard:
         self.queue = queue
         self.current_processing = None
         self.recent_decisions = deque(maxlen=10)
+        self.console_logs = deque(maxlen=15)  # Keep last 15 console messages
         self.stats = {
             'items_processed': 0,
             'high_confidence': 0,
@@ -204,6 +205,47 @@ class StatusDashboard:
             box=box.DOUBLE if alerts and "REVISED SIGNAL" in str(alerts[0]) else box.ROUNDED
         )
     
+    def create_console_panel(self) -> Panel:
+        """Create console output panel."""
+        console_text = Text()
+        
+        if self.console_logs:
+            for log_entry in self.console_logs:
+                # Parse log entry for styling
+                if isinstance(log_entry, dict):
+                    msg = log_entry.get('message', '')
+                    level = log_entry.get('level', 'info')
+                    timestamp = log_entry.get('timestamp', '')
+                    
+                    # Add timestamp if present
+                    if timestamp:
+                        console_text.append(f"[{timestamp}] ", style="dim cyan")
+                    
+                    # Style based on level
+                    if level == 'error':
+                        console_text.append(msg, style="red")
+                    elif level == 'warning':
+                        console_text.append(msg, style="yellow")
+                    elif level == 'success':
+                        console_text.append(msg, style="green")
+                    else:
+                        console_text.append(msg, style="white")
+                else:
+                    # Plain text log
+                    console_text.append(str(log_entry), style="white")
+                    
+                console_text.append("\n")
+        else:
+            console_text.append("No console output yet...", style="dim")
+        
+        return Panel(
+            console_text,
+            title="📟 Console Output",
+            border_style="blue",
+            height=8,
+            box=box.ROUNDED
+        )
+    
     def create_layout(self) -> Layout:
         """Create the dashboard layout."""
         layout = Layout()
@@ -211,7 +253,8 @@ class StatusDashboard:
         layout.split_column(
             Layout(name="header", size=3),
             Layout(name="body"),
-            Layout(name="alerts", size=5)
+            Layout(name="alerts", size=5),
+            Layout(name="console", size=8)  # Console output at bottom
         )
         
         layout["body"].split_row(
@@ -235,6 +278,7 @@ class StatusDashboard:
         layout["stats"].update(self.create_statistics_panel())
         layout["right"].update(self.create_decisions_panel())
         layout["alerts"].update(self.create_alerts_panel())
+        layout["console"].update(self.create_console_panel())
         
         return layout
     
@@ -266,6 +310,17 @@ class StatusDashboard:
     def set_processing(self, minute_key: Optional[str]):
         """Set current processing item."""
         self.current_processing = minute_key
+    
+    def add_console_log(self, message: str, level: str = "info", timestamp: str = None):
+        """Add a console log message."""
+        if timestamp is None:
+            timestamp = datetime.now().strftime('%H:%M:%S')
+        
+        self.console_logs.append({
+            'message': message,
+            'level': level,
+            'timestamp': timestamp
+        })
     
     def run(self):
         """Run the dashboard in a separate thread."""

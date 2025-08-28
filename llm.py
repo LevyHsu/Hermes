@@ -708,9 +708,10 @@ def refine_decision(client: LMStudioClient, news_item: Dict[str, Any], decision:
         # Handle confidence
         refined["revised_confidence"] = max(0, min(100, result.get("revised_confidence", decision["confidence"])))
         
-        # Handle expected price
+        # Handle expected price - map to both field names for compatibility
         expected_price = result.get("expected_high_price", 0)
         refined["expected_high_price"] = expected_price if expected_price > 0 else None
+        refined["expected_price"] = expected_price if expected_price > 0 else None  # For dashboard compatibility
         
         # Handle timeframe
         refined["horizon_hours"] = result.get("horizon_hours", 24)
