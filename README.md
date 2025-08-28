@@ -202,7 +202,7 @@ pkill -9 -f "python.*llm.py"
 
 ## License
 
-MIT License - see LICENSE file for details
+GPL v3 License - see LICENSE file for details
 
 ## Disclaimer
 
