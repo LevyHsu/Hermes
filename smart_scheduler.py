@@ -31,7 +31,7 @@ class SmartScheduler:
         self.ensure_database()
         
         # Configuration
-        self.min_harvest_time = 10.0
+        self.min_harvest_time = 15.0  # Ensure adequate time for feed checking
         self.max_harvest_time = 25.0
         self.total_cycle_time = 55.0
         self.llm_time_buffer = 5.0  # Reserve for LLM startup
@@ -223,12 +223,12 @@ class SmartScheduler:
         
         # Base time calculation with market hours boost
         if adjusted_estimate == 0 and previous_news_count <= 0:
-            # Truly nothing to do
-            harvest_time = 5.0
-        elif adjusted_estimate <= 5:
-            harvest_time = 10.0
-        elif adjusted_estimate <= 15:
+            # Even with no news, give adequate time for feed checking
             harvest_time = 15.0
+        elif adjusted_estimate <= 5:
+            harvest_time = 15.0
+        elif adjusted_estimate <= 15:
+            harvest_time = 18.0
         elif adjusted_estimate <= 30:
             harvest_time = 20.0
         else:

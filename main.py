@@ -155,7 +155,7 @@ def harvest_news(timeout: float = 20.0, verbose: bool = False) -> Optional[Path]
         return None
 
 
-def process_with_llm(news_file: Path, args: argparse.Namespace, timeout: float = 40.0) -> Optional[List[Dict]]:
+def process_with_llm(news_file: Path, args: argparse.Namespace, client: LMStudioClient, timeout: float = 40.0) -> Optional[List[Dict]]:
     """Process news through LLM for trading decisions."""
     global STOP
     if STOP:
@@ -175,9 +175,6 @@ def process_with_llm(news_file: Path, args: argparse.Namespace, timeout: float =
         if not listings:
             logging.error("No stock listings available")
             return []
-        
-        # Initialize LLM client - direct instantiation, no subprocess!
-        client = LMStudioClient(server_host=args.llm_host, verbose=args.verbose)
         
         # Process each news item
         results = []
@@ -267,6 +264,7 @@ def log_trading_signals(results: List[Dict], minute_key: str):
 
 
 def run_minute_cycle(args: argparse.Namespace, minute: int, 
+                    llm_client: LMStudioClient,
                     previous_news_count: int = 0,
                     recent_timeouts: int = 0) -> Tuple[int, bool]:
     """Run one complete minute cycle."""
@@ -321,7 +319,7 @@ def run_minute_cycle(args: argparse.Namespace, minute: int,
     remaining = max(10, 60 - elapsed)
     llm_timeout = min(llm_time, remaining)
     
-    results = process_with_llm(news_file, args, timeout=llm_timeout)
+    results = process_with_llm(news_file, args, llm_client, timeout=llm_timeout)
     llm_timed_out = (results is None)
     
     # Step 3: Log results
@@ -379,6 +377,40 @@ def main():
     # Parse arguments
     args = get_args()
     
+    # Handle clean operation if requested
+    if args.clean or args.force_clean:
+        if not args.force_clean:
+            response = input("This will delete all data files. Are you sure? (y/N): ")
+            if response.lower() != 'y':
+                print("Clean operation cancelled")
+                return 0
+        
+        print("Cleaning all data directories...")
+        import shutil
+        
+        # Clean directories
+        dirs_to_clean = [NEWS_DIR, LLM_DIR, RESULT_DIR, TRADE_LOG_DIR]
+        for directory in dirs_to_clean:
+            if directory.exists():
+                shutil.rmtree(directory)
+                directory.mkdir(parents=True, exist_ok=True)
+                print(f"  Cleaned: {directory}")
+        
+        # Clean database files
+        db_files = [
+            DATA_DIR / "scheduler.db",
+            NEWS_DIR.parent / "news" / ".seen.db", 
+            LLM_DIR.parent / "llm" / ".decisions.db"
+        ]
+        for db_file in db_files:
+            if db_file.exists():
+                db_file.unlink()
+                print(f"  Removed: {db_file}")
+        
+        print("Clean complete!")
+        if args.clean and not args.force_clean:
+            return 0  # Exit after interactive clean
+    
     # Register signal handlers EARLY
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
@@ -401,6 +433,43 @@ def main():
                 logging.error("Cannot proceed without stock listings")
                 return 1
     
+    # Initialize LLM client once
+    logging.info("Initializing LLM client...")
+    try:
+        llm_client = LMStudioClient(server_host=args.llm_host, verbose=args.verbose)
+    except Exception as e:
+        logging.error(f"Failed to initialize LLM client: {e}")
+        return 1
+    
+    # Perform initial backfill (mark recent news as seen)
+    logging.info("Performing initial news backfill (2 minutes)...")
+    backfill_end = datetime.now() + timedelta(minutes=2)
+    backfill_cycles = 0
+    
+    while not STOP and datetime.now() < backfill_end:
+        backfill_cycles += 1
+        cycle_start = datetime.now()
+        
+        # Just harvest to populate seen.db, don't process
+        news_file = harvest_news(timeout=20.0, verbose=args.verbose)
+        if news_file:
+            try:
+                with open(news_file, 'r') as f:
+                    items = json.load(f)
+                logging.info(f"Backfill cycle {backfill_cycles}: marked {len(items)} items as seen")
+            except:
+                pass
+        
+        # Sleep until next minute if time remains
+        elapsed = (datetime.now() - cycle_start).total_seconds()
+        if elapsed < 60 and not STOP:
+            sleep_until_next_minute()
+    
+    if STOP:
+        return 0
+    
+    logging.info(f"Backfill complete after {backfill_cycles} cycles")
+    
     # Main loop variables
     minute_counter = 0
     previous_news_count = 0
@@ -420,7 +489,7 @@ def main():
             
             # Run the minute cycle
             news_count, timed_out = run_minute_cycle(
-                args, minute_counter, previous_news_count, recent_timeouts
+                args, minute_counter, llm_client, previous_news_count, recent_timeouts
             )
             
             # Update tracking
