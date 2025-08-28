@@ -319,13 +319,28 @@ def run_minute_cycle(args: argparse.Namespace, minute: int,
     except:
         pass
     
-    # Step 2: Process with LLM
+    # Check if we're approaching minute boundary (55s limit)
     elapsed = (datetime.now() - start_time).total_seconds()
-    remaining = max(10, 60 - elapsed)
+    if elapsed > 55:
+        logging.warning(f"Minute boundary approaching ({elapsed:.1f}s), skipping LLM processing")
+        return actual_news_count, False
+    
+    # Step 2: Process with LLM with strict time boundary
+    remaining = max(5, 55 - elapsed)  # Hard stop at 55s into minute
     llm_timeout = min(llm_time, remaining)
+    
+    # Add minute boundary check
+    minute_start = start_time.replace(second=0, microsecond=0)
+    current_minute = minute_start.strftime("%H:%M")
     
     results = process_with_llm(news_file, args, llm_client, timeout=llm_timeout)
     llm_timed_out = (results is None)
+    
+    # Check if we've crossed minute boundary
+    now = datetime.now()
+    if now.minute != minute_start.minute:
+        logging.warning(f"Processing for {current_minute} crossed into next minute, abandoning")
+        return actual_news_count, True
     
     # Step 3: Log results
     if results:
@@ -519,12 +534,16 @@ def main():
             if minute_counter % 10 == 0:
                 logging.debug(f"Health check: {minute_counter} cycles completed")
             
-            # Sleep until next minute
+            # Sleep until next minute or skip if we're behind
             cycle_duration = (datetime.now() - cycle_start).total_seconds()
             if cycle_duration < 60 and not STOP:
                 sleep_until_next_minute()
             elif not STOP:
                 logging.warning(f"Cycle {minute_counter} took {cycle_duration:.1f}s (>60s)")
+                # Skip to next minute boundary if we're significantly behind
+                if cycle_duration > 90:
+                    logging.error(f"Cycle severely delayed ({cycle_duration:.1f}s), realigning to next minute")
+                    sleep_until_next_minute()
                 
         except KeyboardInterrupt:
             STOP = True

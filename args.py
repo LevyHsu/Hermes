@@ -51,9 +51,9 @@ LISTING_UPDATE_MINUTES_BEFORE_OPEN = 30  # Update at 9:00 AM ET
 # =====================================================================
 
 # News feed settings
-NEWS_THREADS = 4  # Number of concurrent threads for fetching feeds
-NEWS_REQUEST_TIMEOUT = 10.0  # Timeout for each RSS feed request (seconds)
-NEWS_CYCLE_BUDGET = 20.0  # Time budget per minute for news harvesting (seconds)
+NEWS_THREADS = 16  # Number of concurrent threads for fetching feeds
+NEWS_REQUEST_TIMEOUT = 12.0  # Timeout for each RSS feed request (seconds)
+NEWS_CYCLE_BUDGET = 15.0  # Time budget per minute for news harvesting (seconds)
 NEWS_VERBOSE = True  # Enable detailed logging for news harvester
 
 # Smart scheduling settings
