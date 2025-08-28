@@ -379,7 +379,12 @@ class LMStudioClient:
     def __init__(self, server_host: str, verbose: bool = False, timeout: float = 120.0):
         host = normalize_server_host(server_host)
         lms.configure_default_client(host)
-        self.model = lms.llm()
+        # Try to use any available model - don't specify model identifier
+        try:
+            self.model = lms.llm(model_identifier="openai/gpt-oss-120b")
+        except:
+            # Fall back to default if specific model not available
+            self.model = lms.llm()
         self.host = host
         self.verbose = verbose
         self.timeout = timeout
@@ -703,9 +708,10 @@ def refine_decision(client: LMStudioClient, news_item: Dict[str, Any], decision:
         # Handle confidence
         refined["revised_confidence"] = max(0, min(100, result.get("revised_confidence", decision["confidence"])))
         
-        # Handle expected price
+        # Handle expected price - map to both field names for compatibility
         expected_price = result.get("expected_high_price", 0)
         refined["expected_high_price"] = expected_price if expected_price > 0 else None
+        refined["expected_price"] = expected_price if expected_price > 0 else None  # For dashboard compatibility
         
         # Handle timeframe
         refined["horizon_hours"] = result.get("horizon_hours", 24)
