@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 
 # Local imports
 from args import get_args
+from status_dashboard import StatusDashboard
 from fetch_us_listings import run as update_stock_listings
 from llm import LMStudioClient
 from news_harvester import harvest_single_cycle
@@ -38,16 +39,21 @@ LLM_CLIENT = None
 HARVESTER_THREAD = None
 PROCESSOR_THREAD = None
 NEWS_QUEUE = None
+DASHBOARD = None
 
 
 def handle_signal(signum, frame):
     """Handle shutdown signals gracefully."""
-    global STOP, LLM_CLIENT
+    global STOP, LLM_CLIENT, DASHBOARD
     STOP = True
     
     try:
         logging.info(f"Received signal {signum}, shutting down gracefully...")
         
+        # Stop dashboard if running
+        if DASHBOARD:
+            DASHBOARD.stop()
+            
         # Close LLM client if it exists
         if LLM_CLIENT:
             logging.info("Closing LLM client connection...")
@@ -152,6 +158,10 @@ def harvester_thread(args):
                         
                         if NEWS_QUEUE.add(news_item):
                             logging.info(f"Added {minute_key} to queue: {len(items)} items in {harvest_time:.1f}s")
+                            
+                            # Update dashboard
+                            if DASHBOARD:
+                                DASHBOARD.update_queue_stats(NEWS_QUEUE.get_stats())
                         
                 except Exception as e:
                     logging.error(f"Error processing harvested news: {e}")
@@ -199,6 +209,10 @@ def processor_thread(args):
                 
             current_processing = news_item.minute_key
             logging.info(f"Processing {news_item.minute_key}: {news_item.item_count} items, age {news_item.age_seconds:.1f}s")
+            
+            # Update dashboard
+            if DASHBOARD:
+                DASHBOARD.set_processing(news_item.minute_key)
             
             start_time = time.time()
             
@@ -249,6 +263,10 @@ def processor_thread(args):
                                     action = decision['action'] 
                                     confidence = decision['confidence']
                                     logging.info(f"HIGH CONFIDENCE: {ticker} {action} @ {confidence}%")
+                                    
+                                    # Add to dashboard
+                                    if DASHBOARD:
+                                        DASHBOARD.add_decision(decision)
                                     
                 except Exception as e:
                     logging.error(f"Batch processing error: {e}")
@@ -508,7 +526,7 @@ def clean_data_directories():
 
 def main():
     """Main entry point - simplified with priority queue."""
-    global STOP, LLM_CLIENT, NEWS_QUEUE, HARVESTER_THREAD, PROCESSOR_THREAD
+    global STOP, LLM_CLIENT, NEWS_QUEUE, HARVESTER_THREAD, PROCESSOR_THREAD, DASHBOARD
     
     # Parse arguments
     args = get_args()
@@ -562,6 +580,12 @@ def main():
     logging.info("Creating priority queue (size=64)...")
     NEWS_QUEUE = TimeOrderedNewsQueue(max_size=64)
     
+    # Initialize dashboard if not in quiet mode
+    if not args.quiet and sys.stdout.isatty():
+        logging.info("Initializing status dashboard...")
+        DASHBOARD = StatusDashboard(queue=NEWS_QUEUE)
+        DASHBOARD.run()
+    
     # Start threads
     logging.info("Starting harvester and processor threads...")
     
@@ -587,6 +611,11 @@ def main():
                     f"Processed: {stats['items_processed']}, "
                     f"Dropped: {stats['items_dropped']}"
                 )
+                
+                # Update dashboard with latest stats
+                if DASHBOARD:
+                    DASHBOARD.update_queue_stats(stats)
+                    
                 last_status = time.time()
                 
     except KeyboardInterrupt:
@@ -604,6 +633,10 @@ def main():
     # Cleanup
     logging.info("="*60)
     logging.info("IBKR-BOT SHUTTING DOWN")
+    
+    # Stop dashboard
+    if DASHBOARD:
+        DASHBOARD.stop()
     
     # Final stats
     if NEWS_QUEUE:
