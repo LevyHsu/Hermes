@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Simplified IBKR-BOT using Priority Queue System
-No smart scheduling needed - queue handles everything
+Hermes - Fast News Ingestion & Trading Signal System
+Named after the Greek messenger god and patron of trade
+Priority Queue System - no smart scheduling needed, queue handles everything
 """
 
 import argparse
@@ -304,7 +305,7 @@ def processor_thread(args):
                 # Log trading signals to data/trade-log
                 log_trading_signals(results, news_item.minute_key, args)
                 
-                # Log human-readable decisions to logs/
+                # Log revised confidence signals to daily log file
                 log_human_readable_decisions(results, news_item.minute_key, news_item.items)
                 
                 msg = f"Completed {news_item.minute_key} in {process_time:.1f}s - {len(results)} items with decisions"
@@ -402,90 +403,74 @@ def process_single_news_item(item: Dict, llm_client, confidence_threshold: float
 
 
 def log_human_readable_decisions(results: List[Dict], minute_key: str, news_items: List[Dict]):
-    """Log human-readable trading decisions to logs directory."""
+    """Log only revised confidence signals to daily log file."""
     try:
-        # Create human-readable log file
-        decision_log_file = LOGS_DIR / f"decisions_{minute_key}.log"
+        # Import threshold from args
+        from args import REVISED_CONFIDENCE_THRESHOLD
         
-        with open(decision_log_file, 'w') as f:
-            f.write(f"="*80 + "\n")
-            f.write(f"TRADING DECISIONS - {minute_key}\n")
-            f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"="*80 + "\n\n")
+        # Create daily high confidence log file (YYMMDD format)
+        date_str = datetime.now().strftime("%y%m%d")  # e.g., "250828"
+        daily_log_file = LOGS_DIR / f"{date_str}_high_conf.log"
+        
+        # Map news items by ID for easy lookup
+        news_by_id = {item.get('id'): item for item in news_items if item.get('id')}
+        
+        # Filter and log only revised confidence signals
+        high_conf_signals = []
+        
+        for result in results:
+            news_id = result.get('news_id')
+            news_item = news_by_id.get(news_id, {})
             
-            # Map news items by ID for easy lookup
-            news_by_id = {item.get('id'): item for item in news_items if item.get('id')}
-            
-            for result in results:
-                news_id = result.get('news_id')
-                news_item = news_by_id.get(news_id, {})
+            for decision in result.get('decisions', []):
+                # Only log if revised confidence meets threshold
+                if decision.get('revised_confidence', 0) >= REVISED_CONFIDENCE_THRESHOLD:
+                    high_conf_signals.append((decision, news_item))
+        
+        # Only write if we have high confidence signals
+        if high_conf_signals:
+            with open(daily_log_file, 'a') as f:
+                # Write header if file is new
+                if daily_log_file.stat().st_size == 0:
+                    f.write(f"="*80 + "\n")
+                    f.write(f"HIGH CONFIDENCE TRADING SIGNALS - {date_str}\n")
+                    f.write(f"Threshold: Revised Confidence >= {REVISED_CONFIDENCE_THRESHOLD}%\n")
+                    f.write(f"="*80 + "\n\n")
                 
-                for decision in result.get('decisions', []):
-                    f.write(f"{'='*60}\n")
-                    f.write(f"TICKER: {decision['ticker']}\n")
-                    f.write(f"ACTION: {decision['action']}\n")
-                    f.write(f"CONFIDENCE: {decision['confidence']}%\n")
-                    
-                    # Add revised confidence if present
-                    if decision.get('revised_confidence'):
-                        f.write(f"REVISED CONFIDENCE: {decision['revised_confidence']}%\n")
+                # Write timestamp header
+                f.write(f"\n[{datetime.now().strftime('%H:%M:%S')}] Minute: {minute_key}\n")
+                f.write("-" * 60 + "\n")
+                
+                for decision, news_item in high_conf_signals:
+                    f.write(f"\n🎯 {decision['ticker']} - {decision['action']}\n")
+                    f.write(f"   Original Confidence: {decision.get('confidence', 0)}%\n")
+                    f.write(f"   REVISED CONFIDENCE: {decision['revised_confidence']}%\n")
                     
                     # Add price targets if present
-                    if decision.get('entry_price'):
-                        f.write(f"ENTRY PRICE: ${decision['entry_price']:.2f}\n")
                     if decision.get('expected_price'):
-                        f.write(f"TARGET PRICE: ${decision['expected_price']:.2f}\n")
-                    if decision.get('stop_loss'):
-                        f.write(f"STOP LOSS: ${decision['stop_loss']:.2f}\n")
-                    if decision.get('expected_timeframe'):
-                        f.write(f"TIMEFRAME: {decision['expected_timeframe']}\n")
+                        f.write(f"   TARGET PRICE: ${decision['expected_price']:.2f}\n")
+                    if decision.get('horizon_hours'):
+                        f.write(f"   HORIZON: {decision['horizon_hours']} hours\n")
                     
-                    f.write(f"\n--- NEWS SOURCE ---\n")
+                    # News source
                     if news_item:
-                        f.write(f"TITLE: {news_item.get('title', 'N/A')}\n")
-                        f.write(f"SOURCE: {news_item.get('source', 'N/A')}\n")
-                        f.write(f"PUBLISHED: {news_item.get('published', 'N/A')}\n")
-                        f.write(f"LINK: {news_item.get('link', 'N/A')}\n")
-                        
-                        # Add truncated article body
-                        body = news_item.get('article-body', news_item.get('body', ''))
-                        if body:
-                            f.write(f"\nARTICLE EXCERPT:\n")
-                            f.write(f"{body[:500]}...\n" if len(body) > 500 else f"{body}\n")
+                        f.write(f"   News: {news_item.get('title', 'N/A')[:100]}\n")
+                        f.write(f"   Source: {news_item.get('source', 'N/A')}\n")
+                        f.write(f"   Link: {news_item.get('link', 'N/A')}\n")
                     
-                    f.write(f"\n--- INITIAL REASONING ---\n")
-                    f.write(f"{decision.get('reason', 'N/A')}\n")
-                    
-                    # Add refined reasoning if present
+                    # Refined reasoning
                     if decision.get('refined_reason'):
-                        f.write(f"\n--- REFINED REASONING (After Enrichment) ---\n")
-                        f.write(f"{decision['refined_reason']}\n")
+                        f.write(f"   Reasoning: {decision['refined_reason'][:200]}\n")
                     
-                    # Add market context if available
-                    if decision.get('market_context'):
-                        f.write(f"\n--- MARKET CONTEXT ---\n")
-                        f.write(f"{decision['market_context']}\n")
-                    
-                    f.write(f"\n{'='*60}\n\n")
-            
-            f.write(f"\nTotal decisions: {sum(len(r.get('decisions', [])) for r in results)}\n")
-            f.write(f"High confidence (>=70%): {sum(1 for r in results for d in r.get('decisions', []) if d.get('confidence', 0) >= 70)}\n")
-            f.write(f"="*80 + "\n")
-        
-        # Also append to a daily summary log
-        daily_log_file = LOGS_DIR / f"daily_decisions_{datetime.now().strftime('%Y%m%d')}.log"
-        with open(daily_log_file, 'a') as f:
-            f.write(f"\n[{datetime.now().strftime('%H:%M:%S')}] Processed {minute_key}:\n")
-            for result in results:
-                for decision in result.get('decisions', []):
-                    conf = decision.get('revised_confidence', decision.get('confidence', 0))
-                    f.write(f"  • {decision['ticker']}: {decision['action']} @ {conf}%")
-                    if decision.get('expected_price'):
-                        f.write(f" (Target: ${decision['expected_price']:.2f})")
-                    f.write(f"\n")
+                    f.write("\n")
+                
+                f.write("-" * 60 + "\n")
+                
+        # Log count for monitoring
+        logging.info(f"Logged {len(high_conf_signals)} revised confidence signals to {daily_log_file.name}")
                     
     except Exception as e:
-        logging.error(f"Error logging human-readable decisions: {e}")
+        logging.error(f"Error logging revised confidence decisions: {e}")
 
 
 def log_trading_signals(results: List[Dict], minute_key: str, args):
@@ -587,7 +572,7 @@ def main():
     setup_logging(args)
     
     logging.info("="*60)
-    logging.info("IBKR-BOT STARTED (Priority Queue Mode)")
+    logging.info("⚡ HERMES STARTED (Priority Queue Mode)")
     logging.info(f"Configuration: LLM={args.llm_host}, Queue Size=64")
     logging.info("="*60)
     
@@ -663,7 +648,7 @@ def main():
         
     # Cleanup
     logging.info("="*60)
-    logging.info("IBKR-BOT SHUTTING DOWN")
+    logging.info("⚡ HERMES SHUTTING DOWN")
     
     # Stop dashboard
     if DASHBOARD:

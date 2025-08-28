@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-args.py - Centralized configuration and arguments for IBKR-BOT
+args.py - Centralized configuration and arguments for Hermes
 
 This file contains all configuration settings and command-line arguments
 for the trading bot system. Modify these settings to customize behavior.
@@ -118,7 +118,7 @@ ALERT_ON_CONSECUTIVE_FAILURES = 3  # Alert if N consecutive failures occur
 # SEC API configuration (required for fetching listings)
 SEC_USER_AGENT = os.getenv(
     "SEC_USER_AGENT",
-    "IBKR-BOT/1.0 (contact: admin@example.com)"  # CHANGE THIS to your email
+    "Hermes/1.0 (contact: admin@example.com)"  # CHANGE THIS to your email
 )
 
 # =====================================================================
@@ -133,7 +133,7 @@ def create_parser() -> argparse.ArgumentParser:
         Configured ArgumentParser instance
     """
     parser = argparse.ArgumentParser(
-        description="IBKR-BOT Main Orchestrator - Automated Trading Signal Generator",
+        description="Hermes - Fast News Ingestion & Trading Signal System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

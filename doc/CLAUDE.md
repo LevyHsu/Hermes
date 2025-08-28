@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-IBKR-BOT is a financial data pipeline that harvests news, analyzes it with LLM, and generates trading signals.
+Hermes is a financial data pipeline that harvests news, analyzes it with LLM, and generates trading signals - named after the Greek messenger god and patron of trade.
 
 ## System Architecture
 
