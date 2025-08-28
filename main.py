@@ -408,8 +408,7 @@ def main():
                 print(f"  Removed: {db_file}")
         
         print("Clean complete!")
-        if args.clean and not args.force_clean:
-            return 0  # Exit after interactive clean
+        return 0  # Exit after any clean operation
     
     # Register signal handlers EARLY
     signal.signal(signal.SIGINT, handle_signal)
