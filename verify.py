@@ -32,6 +32,9 @@ import os
 import statistics
 import sys
 import threading
+import time
+import random
+import bisect
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -52,6 +55,12 @@ YAHOO_CHART_URL = (
 STOOQ_CSV_URL = (
     "https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
 )  # daily OHLC, last close (not intraday)
+
+# polite concurrency & rate limits to avoid 429s
+YAHOO_MAX_CONCURRENCY = int(os.environ.get("YAHOO_MAX_CONCURRENCY", "2"))  # simultaneous Yahoo calls
+STOOQ_MAX_CONCURRENCY = int(os.environ.get("STOOQ_MAX_CONCURRENCY", "2"))  # simultaneous Stooq calls
+YAHOO_SEM = threading.Semaphore(YAHOO_MAX_CONCURRENCY)
+STOOQ_SEM = threading.Semaphore(STOOQ_MAX_CONCURRENCY)
 
 # --------------------------- Models ---------------------------
 
@@ -98,7 +107,7 @@ class Verification:
 
 # --------------------------- HTTP Helpers ---------------------------
 
-def http_get(url: str, timeout: float = 8.0, headers: Optional[Dict[str, str]] = None) -> bytes:
+def http_get(url: str, timeout: float = 8.0, headers: Optional[Dict[str, str]] = None, host_kind: str = "generic") -> bytes:
     hdrs = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -110,17 +119,58 @@ def http_get(url: str, timeout: float = 8.0, headers: Optional[Dict[str, str]] =
     }
     if headers:
         hdrs.update(headers)
-    req = request.Request(url, headers=hdrs)
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except error.HTTPError as e:
-        # Some Yahoo endpoints occasionally want cookies; retry once without UA
-        if 400 <= e.code < 500:
-            req = request.Request(url)
-            with request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
-        raise
+
+    # choose semaphore by host kind
+    sem = YAHOO_SEM if host_kind == "yahoo" else (STOOQ_SEM if host_kind == "stooq" else threading.Semaphore(1))
+
+    # basic exponential backoff with jitter; respect Retry-After if present
+    max_attempts = 6
+    base_sleep = 0.6
+    for attempt in range(1, max_attempts + 1):
+        with sem:  # limit concurrent calls
+            req = request.Request(url, headers=hdrs)
+            try:
+                with request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read()
+            except error.HTTPError as e:
+                # 429 or 5xx -> retry with backoff; honor Retry-After if present
+                if e.code in (429, 500, 502, 503, 504):
+                    retry_after = None
+                    try:
+                        ra = e.headers.get("Retry-After")
+                        if ra:
+                            retry_after = float(ra)
+                    except Exception:
+                        retry_after = None
+                    sleep_s = retry_after if retry_after is not None else (base_sleep * (2 ** (attempt - 1)))
+                    # add small jitter
+                    sleep_s += random.uniform(0, 0.333)
+                    if attempt == max_attempts:
+                        raise
+                    time.sleep(sleep_s)
+                    # retry once more without custom headers for some strict CDNs
+                    if attempt == 1 and e.code in (400, 401, 403):
+                        try:
+                            req2 = request.Request(url)
+                            with request.urlopen(req2, timeout=timeout) as resp:
+                                return resp.read()
+                        except Exception:
+                            pass
+                    continue
+                elif 400 <= e.code < 500:
+                    # permanent client error (other than 429/401/403 handled above)
+                    raise
+                else:
+                    # unknown; backoff
+                    if attempt == max_attempts:
+                        raise
+                    time.sleep(base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.2))
+            except error.URLError:
+                if attempt == max_attempts:
+                    raise
+                time.sleep(base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.2))
+    # unreachable
+    raise RuntimeError("http_get exhausted retries for: " + url)
 
 # --------------------------- Data Utils ---------------------------
 
@@ -154,7 +204,7 @@ def round_safe(x: Optional[float], n: int = 4) -> Optional[float]:
 def yahoo_quote_price(symbol: str) -> SourcePrice:
     url = YAHOO_QUOTE_URL.format(sym=parse.quote(symbol))
     try:
-        data = json.loads(http_get(url))
+        data = json.loads(http_get(url, host_kind="yahoo"))
         quote = (data.get("quoteResponse", {}) or {}).get("result", [{}])[0]
         price = quote.get("regularMarketPrice")
         as_of = quote.get("regularMarketTime")  # epoch seconds
@@ -170,7 +220,7 @@ def stooq_last_close(symbol: str) -> SourcePrice:
         stooq_sym = f"{stooq_sym}.us"
     url = STOOQ_CSV_URL.format(sym=parse.quote(stooq_sym))
     try:
-        raw = http_get(url).decode("utf-8", errors="ignore")
+        raw = http_get(url, host_kind="stooq").decode("utf-8", errors="ignore")
         # CSV has headers: Symbol,Date,Time,Open,High,Low,Close,Volume
         reader = csv.DictReader(raw.splitlines())
         row = next(reader, None)
@@ -216,7 +266,7 @@ def yahoo_bars(symbol: str, start_ts: int, end_ts: int, interval: Optional[str] 
     if interval is None:
         interval = choose_interval(end_ts - start_ts)
     url = YAHOO_CHART_URL.format(sym=parse.quote(symbol), p1=start_ts, p2=end_ts, interval=parse.quote(interval))
-    data = json.loads(http_get(url))
+    data = json.loads(http_get(url, host_kind="yahoo"))
     result = (data.get("chart", {}) or {}).get("result", [])
     if not result:
         return [], [], [], [], []
@@ -250,6 +300,35 @@ def yahoo_bars(symbol: str, start_ts: int, end_ts: int, interval: Optional[str] 
         _clean(closes),
     )
 
+# Fetch full daily bars from Stooq (fallback for charts)
+def stooq_daily_bars(symbol: str) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
+    # Returns full daily history for symbol from Stooq.
+    stooq_sym = symbol.lower()
+    if "." not in stooq_sym:
+        stooq_sym = f"{stooq_sym}.us"
+    url = f"https://stooq.com/q/d/l/?s={parse.quote(stooq_sym)}&i=d"
+    try:
+        csv_text = http_get(url, host_kind="stooq").decode("utf-8", errors="ignore")
+        reader = csv.DictReader(csv_text.splitlines())
+        ts: List[int] = []
+        o: List[float] = []
+        h: List[float] = []
+        l: List[float] = []
+        c: List[float] = []
+        for row in reader:
+            d = row.get("Date")
+            if not d or d in ("-",""):
+                continue
+            t = int(dt.datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc).timestamp())
+            ts.append(t)
+            o.append(float(row.get("Open") or "nan"))
+            h.append(float(row.get("High") or "nan"))
+            l.append(float(row.get("Low") or "nan"))
+            c.append(float(row.get("Close") or "nan"))
+        return ts, o, h, l, c
+    except Exception:
+        return [], [], [], [], []
+
 # --------------------------- Core Logic ---------------------------
 
 def median_price(sources: List[SourcePrice]) -> Optional[float]:
@@ -262,46 +341,47 @@ def median_price(sources: List[SourcePrice]) -> Optional[float]:
         return float(vals[0])
 
 
-def compute_entry_and_excursions(symbol: str, entry_ts: int) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[float], Optional[int], Optional[float], Optional[float], Optional[int], str]:
-    # Fetch bars from 30 minutes before entry to now
-    now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
-    start_ts = max(entry_ts - 30 * 60, entry_ts - 2 * 3600)
-    interval = choose_interval(now_ts - start_ts)
-    ts, o, h, l, c = yahoo_bars(symbol, start_ts, now_ts, interval)
+def compute_entry_and_excursions_from_bars(entry_ts: int, ts: List[int], o: List[float], h: List[float], l: List[float], c: List[float]) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[float], Optional[int], Optional[float], Optional[float], Optional[int]]:
     if not ts:
-        return (None, None, None, None, None, None, None, None, interval)
-    # Find index at/after entry
-    idx = None
-    for i, t in enumerate(ts):
-        if t >= entry_ts:
-            idx = i
-            break
-    if idx is None:
+        return (None, None, None, None, None, None, None, None)
+    # first index at or after entry_ts (binary search)
+    idx = bisect.bisect_left(ts, entry_ts)
+    if idx >= len(ts):
         idx = len(ts) - 1
-    # Estimate entry price as close at idx (fallback to open)
     entry = c[idx] if not math.isnan(c[idx]) else (o[idx] if not math.isnan(o[idx]) else None)
     entry_time = ts[idx]
-    # Compute MFE/MAE since entry (inclusive)
     highs = [x for x in h[idx:] if not math.isnan(x)]
     lows = [x for x in l[idx:] if not math.isnan(x)]
     if not highs or not lows or entry is None:
-        return (entry, entry_time, None, None, None, None, None, None, interval)
+        return (entry, entry_time, None, None, None, None, None, None)
     max_high = max(highs)
     min_low = min(lows)
-    # Times of extremes
     try:
-        max_i = h[idx:].index(max_high)
-        max_time = ts[idx + max_i]
+        max_i = h[idx:].index(max_high); max_time = ts[idx + max_i]
     except Exception:
         max_time = None
     try:
-        min_i = l[idx:].index(min_low)
-        min_time = ts[idx + min_i]
+        min_i = l[idx:].index(min_low); min_time = ts[idx + min_i]
     except Exception:
         min_time = None
-    # For BUY: MFE = max_high - entry; MAE = entry - min_low
-    # SELL is handled by sign downstream
-    return (entry, entry_time, max_high, min_low, max_time, None, None, min_time, interval)
+    return (entry, entry_time, max_high, min_low, max_time, None, None, min_time)
+
+# Helper: fetch bars for ticker (Yahoo then Stooq fallback)
+def get_bars_for_ticker(symbol: str, start_ts: int, end_ts: int) -> Tuple[List[int], List[float], List[float], List[float], List[float], str]:
+    # try Yahoo first
+    interval = choose_interval(end_ts - start_ts)
+    ts, o, h, l, c = yahoo_bars(symbol, start_ts, end_ts, interval)
+    src = "yahoo"
+    if not ts:
+        # fallback to daily from Stooq
+        ts, o, h, l, c = stooq_daily_bars(symbol)
+        # trim to [start_ts, end_ts]
+        if ts:
+            lo = bisect.bisect_left(ts, start_ts)
+            hi = bisect.bisect_right(ts, end_ts)
+            ts, o, h, l, c = ts[lo:hi], o[lo:hi], h[lo:hi], l[lo:hi], c[lo:hi]
+            src = "stooq_daily"
+    return ts, o, h, l, c, src
 
 
 def pnl_for_action(action: str, entry: float, current: float) -> Tuple[float, float]:
@@ -414,11 +494,15 @@ def process_ticker(ticker: str, signals: List[Signal], now_utc: int) -> List[Ver
     current = median_price(sources)
     prices_by_source = {s.source: s.price for s in sources if s.price is not None}
 
+    # Pre-fetch bars once for all signals (reduces Yahoo hits drastically)
+    earliest = min(to_utc_epoch_seconds(s.timestamp) for s in signals)
+    start_ts = max(earliest - 30 * 60, earliest - 2 * 3600)
+    ts, o, h, l, c, bars_src = get_bars_for_ticker(ticker, start_ts, now_utc)
+
     verifications: List[Verification] = []
     for s in signals:
-        entry, entry_time, max_high, min_low, max_time, _x1, _x2, min_time, interval = compute_entry_and_excursions(
-            ticker, to_utc_epoch_seconds(s.timestamp)
-        )
+        entry_ts = to_utc_epoch_seconds(s.timestamp)
+        entry, entry_time, max_high, min_low, max_time, _x1, _x2, min_time = compute_entry_and_excursions_from_bars(entry_ts, ts, o, h, l, c)
         if entry is None or current is None:
             pnl_abs = pnl_pct = None
             mfe = mae = None
@@ -430,7 +514,7 @@ def process_ticker(ticker: str, signals: List[Signal], now_utc: int) -> List[Ver
             expected_comment = comment_expected_price(s.expected_price, current, max_high, min_low)
         v = Verification(
             ticker=ticker,
-            signal_time_utc=to_utc_epoch_seconds(s.timestamp),
+            signal_time_utc=entry_ts,
             action=s.action,
             revised_confidence=s.revised_confidence,
             expected_price=round_safe(s.expected_price, 4) if s.expected_price is not None else None,
@@ -447,7 +531,7 @@ def process_ticker(ticker: str, signals: List[Signal], now_utc: int) -> List[Ver
             max_loss_abs=round_safe(mae, 4) if mae is not None else None,
             max_loss_pct=round_safe((mae / entry * 100.0) if (mae is not None and entry) else None, 4),
             max_loss_time=min_time,
-            interval_used=interval,
+            interval_used=("daily" if bars_src == "stooq_daily" else choose_interval(now_utc - start_ts)),
         )
         verifications.append(v)
     return verifications
@@ -493,7 +577,7 @@ def main() -> None:
     parser.add_argument("--buy-threshold", type=float, default=80.0, help="Min revised_confidence for BUY")
     parser.add_argument("--sell-threshold", type=float, default=80.0, help="Min revised_confidence for SELL")
     parser.add_argument("--tz", default=DEFAULT_TZ, help="Timezone for naive timestamps in logs")
-    parser.add_argument("--max-workers", type=int, default=min(8, (os.cpu_count() or 4)), help="Worker threads")
+    parser.add_argument("--max-workers", type=int, default=min(4, (os.cpu_count() or 4)), help="Worker threads")
     parser.add_argument("--out", default=None, help="Optional JSONL output path (default auto under data/trade-log)")
     args = parser.parse_args()
 
@@ -521,6 +605,8 @@ def main() -> None:
                 verifications = fut.result()
             except Exception as e:  # pragma: no cover
                 print(f"[ERROR] {ticker}: {e}")
+                if "429" in str(e):
+                    print("   Hint: Reduce --max-workers or set YAHOO_MAX_CONCURRENCY=1; the script will back off on 429 using Retry-After/exponential backoff.")
                 continue
             with lock:
                 results[ticker] = verifications
