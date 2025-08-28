@@ -35,16 +35,21 @@ LOGS_DIR = Path("logs")
 for directory in [DATA_DIR, NEWS_DIR, LLM_DIR, RESULT_DIR, TRADE_LOG_DIR, LISTING_DIR, LOGS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
-# Global flag for graceful shutdown
+# Global flags and resources for graceful shutdown
 STOP = False
+LLM_CLIENT = None
 
 
 def handle_signal(signum, frame):
     """Handle shutdown signals gracefully."""
-    global STOP
+    global STOP, LLM_CLIENT
     STOP = True
     try:
         logging.info(f"Received signal {signum}, shutting down gracefully...")
+        # Close LLM client if it exists
+        if 'LLM_CLIENT' in globals() and LLM_CLIENT:
+            logging.info("Closing LLM client connection...")
+            LLM_CLIENT.close()
     except:
         pass
     print(f"\n[SHUTDOWN] Received signal {signum}, shutting down gracefully...", file=sys.stderr)
@@ -436,8 +441,10 @@ def main():
     
     # Initialize LLM client once
     logging.info("Initializing LLM client...")
+    global LLM_CLIENT
     try:
-        llm_client = LMStudioClient(server_host=args.llm_host, verbose=args.verbose)
+        LLM_CLIENT = LMStudioClient(server_host=args.llm_host, verbose=args.verbose)
+        llm_client = LLM_CLIENT  # Keep local reference for compatibility
     except Exception as e:
         logging.error(f"Failed to initialize LLM client: {e}")
         return 1
@@ -467,6 +474,14 @@ def main():
             sleep_until_next_minute()
     
     if STOP:
+        # Clean up LLM client when interrupted during backfill
+        try:
+            if LLM_CLIENT:
+                logging.info("Closing LLM client connection...")
+                LLM_CLIENT.close()
+                logging.info("LLM client closed successfully")
+        except Exception as e:
+            logging.error(f"Error closing LLM client: {e}")
         return 0
     
     logging.info(f"Backfill complete after {backfill_cycles} cycles")
@@ -531,6 +546,16 @@ def main():
     logging.info("="*60)
     logging.info("IBKR-BOT SHUTTING DOWN")
     logging.info(f"Total cycles completed: {minute_counter}")
+    
+    # Clean up LLM client
+    try:
+        if LLM_CLIENT:
+            logging.info("Closing LLM client connection...")
+            LLM_CLIENT.close()
+            logging.info("LLM client closed successfully")
+    except Exception as e:
+        logging.error(f"Error closing LLM client: {e}")
+    
     logging.info("="*60)
     
     return 0
@@ -541,4 +566,11 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:
         print(f"Fatal error: {e}", file=sys.stderr)
+        # Try to clean up LLM client on fatal error
+        try:
+            if 'LLM_CLIENT' in globals() and LLM_CLIENT:
+                print("Closing LLM client due to fatal error...", file=sys.stderr)
+                LLM_CLIENT.close()
+        except:
+            pass
         sys.exit(1)
