@@ -83,6 +83,15 @@ class StatusDashboard:
     
     def create_decisions_panel(self) -> Panel:
         """Create recent decisions panel."""
+        # Import thresholds from args
+        try:
+            from args import HIGH_CONFIDENCE_THRESHOLD, REVISED_CONFIDENCE_THRESHOLD
+            high_threshold = HIGH_CONFIDENCE_THRESHOLD
+            revised_threshold = REVISED_CONFIDENCE_THRESHOLD
+        except ImportError:
+            high_threshold = 80
+            revised_threshold = 70
+            
         table = Table(show_header=True, box=box.SIMPLE, padding=0)
         table.add_column("Time", style="dim", width=8)
         table.add_column("Ticker", style="cyan", width=6)
@@ -103,14 +112,14 @@ class StatusDashboard:
             action_color = "green" if action == "BUY" else "red"
             action_text = f"[{action_color}]{action}[/{action_color}]"
             
-            # Color coding for confidence
-            conf_color = "bold green" if confidence >= 80 else "yellow" if confidence >= 70 else "white"
+            # Color coding for confidence based on HIGH_CONFIDENCE_THRESHOLD
+            conf_color = "bold green" if confidence >= high_threshold else "yellow" if confidence >= 60 else "white"
             conf_text = f"[{conf_color}]{confidence}%[/{conf_color}]"
             
-            # Revised confidence
+            # Revised confidence based on REVISED_CONFIDENCE_THRESHOLD
             rev_text = ""
             if revised > 0:
-                rev_color = "bold magenta" if revised >= 80 else "magenta"
+                rev_color = "bold magenta" if revised >= revised_threshold else "cyan"
                 rev_text = f"[{rev_color}]{revised}%[/{rev_color}]"
             
             # Target price
@@ -126,6 +135,15 @@ class StatusDashboard:
     
     def create_statistics_panel(self) -> Panel:
         """Create statistics panel."""
+        # Import thresholds from args
+        try:
+            from args import HIGH_CONFIDENCE_THRESHOLD, REVISED_CONFIDENCE_THRESHOLD
+            high_threshold = HIGH_CONFIDENCE_THRESHOLD
+            revised_threshold = REVISED_CONFIDENCE_THRESHOLD
+        except ImportError:
+            high_threshold = 80
+            revised_threshold = 70
+            
         stats_text = Text()
         
         # Decision statistics
@@ -133,10 +151,10 @@ class StatusDashboard:
         stats_text.append(f"Total Decisions: ", style="white")
         stats_text.append(f"{self.stats['total_decisions']}\n", style="bold white")
         
-        stats_text.append(f"High Confidence (≥70%): ", style="white")
+        stats_text.append(f"High Confidence (≥{high_threshold}%): ", style="white")
         stats_text.append(f"{self.stats['high_confidence']}\n", style="bold green")
         
-        stats_text.append(f"Revised (2-Stage): ", style="white")
+        stats_text.append(f"Revised (≥{revised_threshold}%): ", style="white")
         stats_text.append(f"{self.stats['revised_decisions']}\n", style="bold magenta")
         
         # Success rate if available
@@ -153,27 +171,37 @@ class StatusDashboard:
         )
     
     def create_alerts_panel(self) -> Panel:
-        """Create alerts panel for high confidence decisions."""
+        """Create alerts panel for revised high confidence decisions."""
         alerts = []
         
-        # Check for recent high confidence decisions
+        # Import thresholds from args
+        try:
+            from args import REVISED_CONFIDENCE_THRESHOLD
+            threshold = REVISED_CONFIDENCE_THRESHOLD
+        except ImportError:
+            threshold = 70  # Fallback default
+        
+        # Check for recent revised high confidence decisions
         for decision in list(self.recent_decisions)[-3:]:  # Last 3 decisions
-            if decision.get('confidence', 0) >= 80 or decision.get('revised_confidence', 0) >= 80:
+            # Only alert on REVISED confidence that meets threshold
+            if decision.get('revised_confidence', 0) >= threshold:
                 alert_text = Text()
-                alert_text.append("⚠️ HIGH CONFIDENCE: ", style="bold red blink")
+                alert_text.append("⚠️ REVISED SIGNAL: ", style="bold magenta")  # No blink
                 alert_text.append(f"{decision['ticker']} ", style="bold cyan")
                 alert_text.append(f"{decision['action']} ", style="bold green" if decision['action'] == 'BUY' else "bold red")
-                alert_text.append(f"@ {decision.get('revised_confidence', decision['confidence'])}%", style="bold yellow")
+                alert_text.append(f"@ {decision['revised_confidence']}%", style="bold yellow")
+                if decision.get('expected_price'):
+                    alert_text.append(f" Target: ${decision['expected_price']:.2f}", style="cyan")
                 alerts.append(alert_text)
         
         if not alerts:
-            alerts.append(Text("No high confidence signals", style="dim"))
+            alerts.append(Text("No revised high confidence signals", style="dim"))
         
         return Panel(
             Columns(alerts, padding=(0, 1)),
-            title="🚨 Alerts",
-            border_style="red",
-            box=box.DOUBLE if alerts and "HIGH CONFIDENCE" in str(alerts[0]) else box.ROUNDED
+            title="🎯 Refined Alerts",
+            border_style="magenta",
+            box=box.DOUBLE if alerts and "REVISED SIGNAL" in str(alerts[0]) else box.ROUNDED
         )
     
     def create_layout(self) -> Layout:
@@ -212,14 +240,23 @@ class StatusDashboard:
     
     def add_decision(self, decision: Dict[str, Any]):
         """Add a new decision to the dashboard."""
+        # Import thresholds from args
+        try:
+            from args import HIGH_CONFIDENCE_THRESHOLD, REVISED_CONFIDENCE_THRESHOLD
+            high_threshold = HIGH_CONFIDENCE_THRESHOLD
+            revised_threshold = REVISED_CONFIDENCE_THRESHOLD
+        except ImportError:
+            high_threshold = 80
+            revised_threshold = 70
+            
         decision['time'] = datetime.now().strftime('%H:%M:%S')
         self.recent_decisions.append(decision)
         
         # Update statistics
         self.stats['total_decisions'] += 1
-        if decision.get('confidence', 0) >= 70:
+        if decision.get('confidence', 0) >= high_threshold:
             self.stats['high_confidence'] += 1
-        if decision.get('revised_confidence', 0) > 0:
+        if decision.get('revised_confidence', 0) >= revised_threshold:
             self.stats['revised_decisions'] += 1
     
     def update_queue_stats(self, stats: Dict[str, Any]):
