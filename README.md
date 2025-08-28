@@ -1,4 +1,4 @@
-# IBKR-BOT
+# Hermes
 
 AI-powered trading signal system that harvests financial news, analyzes it with LLM, and generates real-time trading decisions.
 
@@ -16,8 +16,8 @@ AI-powered trading signal system that harvests financial news, analyzes it with 
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/IBKR-BOT.git
-cd IBKR-BOT
+git clone https://github.com/LevyHsu/Hermes.git
+cd Hermes
 
 # Create virtual environment
 python3 -m venv .venv
@@ -105,7 +105,7 @@ Options:
 ## Data Structure
 
 ```
-IBKR-BOT/
+Hermes/
 ├── data/
 │   ├── news/              # Raw news (YYMMDDHHMM.json)
 │   ├── llm/               # LLM decisions by minute
@@ -202,7 +202,7 @@ pkill -9 -f "python.*llm.py"
 
 ## License
 
-MIT License - see LICENSE file for details
+GPL v3 License - see LICENSE file for details
 
 ## Disclaimer
 
@@ -210,6 +210,6 @@ This software is for educational purposes only. Not financial advice. Use at you
 
 ## Support
 
-- Issues: [GitHub Issues](https://github.com/yourusername/IBKR-BOT/issues)
+- Issues: [GitHub Issues](https://github.com/LevyHsu/Hermes/issues)
 - Documentation: [doc/](doc/)
 - Tests: [test/](test/)

@@ -1,6 +1,6 @@
 # Documentation
 
-This directory contains all documentation for the IBKR-BOT trading signal system.
+This directory contains all documentation for the Hermes trading signal system.
 
 ## 📚 Available Documentation
 

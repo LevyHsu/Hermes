@@ -1,4 +1,4 @@
-# IBKR-BOT Main Orchestrator Usage Guide
+# Hermes Main Orchestrator Usage Guide
 
 ## Overview
 
@@ -220,10 +220,10 @@ After=network.target
 [Service]
 Type=simple
 User=youruser
-WorkingDirectory=/path/to/IBKR-BOT
+WorkingDirectory=/path/to/Hermes
 Environment="SEC_USER_AGENT=YourBot/1.0 (your@email.com)"
 Environment="LMSTUDIO_SERVER_HOST=localhost:1234"
-ExecStart=/path/to/venv/bin/python /path/to/IBKR-BOT/main.py
+ExecStart=/path/to/venv/bin/python /path/to/Hermes/main.py
 Restart=always
 RestartSec=10
 

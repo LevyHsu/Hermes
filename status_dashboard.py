@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Rich terminal status dashboard for IBKR-BOT
+Rich terminal status dashboard for Hermes
 Shows queue status, current processing, and trading decisions with colors
 """
 
@@ -47,7 +47,7 @@ class StatusDashboard:
     def create_header(self) -> Panel:
         """Create header panel."""
         header_text = Text()
-        header_text.append("🤖 IBKR-BOT ", style="bold cyan")
+        header_text.append("⚡ Hermes ", style="bold cyan")
         header_text.append("Priority Queue Trading System", style="white")
         header_text.append(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim")
         

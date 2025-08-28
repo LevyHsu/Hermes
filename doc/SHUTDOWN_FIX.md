@@ -73,7 +73,7 @@ python main.py --verbose
 3. Should see:
 ```
 [SHUTDOWN] Received signal 2, shutting down gracefully...
-IBKR-BOT SHUTTING DOWN
+HERMES SHUTTING DOWN
 All child processes terminated
 ```
 
