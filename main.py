@@ -380,27 +380,29 @@ def main():
     # Handle clean operation if requested
     if args.clean or args.force_clean:
         if not args.force_clean:
-            response = input("This will delete all data files. Are you sure? (y/N): ")
+            response = input("This will delete all data files and logs. Are you sure? (y/N): ")
             if response.lower() != 'y':
                 print("Clean operation cancelled")
                 return 0
         
-        print("Cleaning all data directories...")
+        print("Cleaning all data directories and logs...")
         import shutil
         
-        # Clean directories
-        dirs_to_clean = [NEWS_DIR, LLM_DIR, RESULT_DIR, TRADE_LOG_DIR]
+        # Clean directories (including logs)
+        dirs_to_clean = [NEWS_DIR, LLM_DIR, RESULT_DIR, TRADE_LOG_DIR, LOGS_DIR]
         for directory in dirs_to_clean:
             if directory.exists():
                 shutil.rmtree(directory)
-                directory.mkdir(parents=True, exist_ok=True)
-                print(f"  Cleaned: {directory}")
+            # Recreate the directory
+            directory.mkdir(parents=True, exist_ok=True)
+            print(f"  Cleaned: {directory}")
         
         # Clean database files
         db_files = [
-            DATA_DIR / "scheduler.db",
-            NEWS_DIR.parent / "news" / ".seen.db", 
-            LLM_DIR.parent / "llm" / ".decisions.db"
+            DATA_DIR / ".scheduler_history.db",  # Smart scheduler history
+            DATA_DIR / ".feed_stats.db",  # Feed statistics
+            NEWS_DIR / ".seen.db",  # Seen news items
+            LLM_DIR / ".decisions.db"  # LLM decisions
         ]
         for db_file in db_files:
             if db_file.exists():
