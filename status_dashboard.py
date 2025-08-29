@@ -26,12 +26,36 @@ from rich import box
 class StatusDashboard:
     """Terminal dashboard for monitoring bot status."""
     
-    def __init__(self, queue=None):
+    def __init__(self, queue=None, recent_limit=None, max_recent=None):
         self.console = Console()
         self.queue = queue
         self.current_processing = None
-        self.recent_decisions = deque(maxlen=10)
-        self.console_logs = deque(maxlen=15)  # Keep last 15 console messages
+        
+        # Handle both parameter names for compatibility
+        limit = recent_limit or max_recent or 30
+        
+        # Import dashboard config
+        try:
+            from args import (
+                DASHBOARD_MIN_RECENT_DECISIONS,
+                DASHBOARD_MAX_RECENT_DECISIONS,
+                DASHBOARD_CONSOLE_LOG_LINES,
+                DASHBOARD_COMPACT_MODE_THRESHOLD
+            )
+            self.min_recent = DASHBOARD_MIN_RECENT_DECISIONS
+            self.max_recent = DASHBOARD_MAX_RECENT_DECISIONS
+            self.console_log_lines = DASHBOARD_CONSOLE_LOG_LINES
+            self.compact_threshold = DASHBOARD_COMPACT_MODE_THRESHOLD
+        except ImportError:
+            self.min_recent = 10
+            self.max_recent = 200
+            self.console_log_lines = 15
+            self.compact_threshold = 20
+        
+        # Ensure limit is within bounds
+        self.recent_limit = max(self.min_recent, min(self.max_recent, limit))
+        self.recent_decisions = deque(maxlen=self.recent_limit)
+        self.console_logs = deque(maxlen=self.console_log_lines)
         self.stats = {
             'items_processed': 0,
             'high_confidence': 0,
@@ -83,7 +107,7 @@ class StatusDashboard:
         )
     
     def create_decisions_panel(self) -> Panel:
-        """Create recent decisions panel."""
+        """Create recent decisions panel with flexible display."""
         # Import thresholds from args
         try:
             from args import HIGH_CONFIDENCE_THRESHOLD, REVISED_CONFIDENCE_THRESHOLD
@@ -92,14 +116,30 @@ class StatusDashboard:
         except ImportError:
             high_threshold = 80
             revised_threshold = 70
-            
-        table = Table(show_header=True, box=box.SIMPLE, padding=0)
-        table.add_column("Time", style="dim", width=8)
-        table.add_column("Ticker", style="cyan", width=6)
-        table.add_column("Action", width=6)
-        table.add_column("Conf", width=4)
-        table.add_column("Rev", width=4)
-        table.add_column("Target", width=8)
+        
+        # Determine display mode based on number of decisions
+        num_decisions = len(self.recent_decisions)
+        use_compact = num_decisions > self.compact_threshold
+        
+        # Create table with appropriate formatting
+        if use_compact:
+            # Compact mode: smaller columns, no padding
+            table = Table(show_header=True, box=None, padding=0, pad_edge=False)
+            table.add_column("Time", style="dim", width=5)
+            table.add_column("Tkr", style="cyan", width=5)
+            table.add_column("Act", width=3)
+            table.add_column("C%", width=3)
+            table.add_column("R%", width=3)
+            table.add_column("Tgt", width=6)
+        else:
+            # Normal mode: full display
+            table = Table(show_header=True, box=box.SIMPLE, padding=0)
+            table.add_column("Time", style="dim", width=8)
+            table.add_column("Ticker", style="cyan", width=6)
+            table.add_column("Action", width=6)
+            table.add_column("Conf", width=4)
+            table.add_column("Rev", width=4)
+            table.add_column("Target", width=8)
         
         for decision in self.recent_decisions:
             time_str = decision.get('time', '')
@@ -109,28 +149,57 @@ class StatusDashboard:
             revised = decision.get('revised_confidence', 0)
             target = decision.get('expected_price', '')
             
-            # Color coding for action
-            action_color = "green" if action == "BUY" else "red"
-            action_text = f"[{action_color}]{action}[/{action_color}]"
-            
-            # Color coding for confidence based on HIGH_CONFIDENCE_THRESHOLD
-            conf_color = "bold green" if confidence >= high_threshold else "yellow" if confidence >= 60 else "white"
-            conf_text = f"[{conf_color}]{confidence}%[/{conf_color}]"
-            
-            # Revised confidence based on REVISED_CONFIDENCE_THRESHOLD
-            rev_text = ""
-            if revised > 0:
-                rev_color = "bold magenta" if revised >= revised_threshold else "cyan"
-                rev_text = f"[{rev_color}]{revised}%[/{rev_color}]"
-            
-            # Target price
-            target_text = f"${target:.2f}" if target else "-"
+            # Format based on display mode
+            if use_compact:
+                # Compact formatting
+                time_str = time_str[-5:] if time_str else ""  # Show only HH:MM
+                ticker = ticker[:5]  # Truncate long tickers
+                action_short = "B" if action == "BUY" else "S" if action == "SELL" else "-"
+                action_color = "green" if action == "BUY" else "red"
+                action_text = f"[{action_color}]{action_short}[/{action_color}]"
+                
+                # Simplified confidence display (no % sign to save space)
+                conf_color = "bold green" if confidence >= high_threshold else "yellow" if confidence >= 60 else "white"
+                conf_text = f"[{conf_color}]{confidence:0.0f}[/{conf_color}]"
+                
+                rev_text = ""
+                if revised > 0:
+                    rev_color = "bold magenta" if revised >= revised_threshold else "cyan"
+                    rev_text = f"[{rev_color}]{revised:0.0f}[/{rev_color}]"
+                
+                # Compact target price
+                if target:
+                    if target >= 1000:
+                        target_text = f"{target/1000:.1f}K"
+                    else:
+                        target_text = f"{target:.0f}"
+                else:
+                    target_text = "-"
+            else:
+                # Normal formatting
+                action_color = "green" if action == "BUY" else "red"
+                action_text = f"[{action_color}]{action}[/{action_color}]"
+                
+                conf_color = "bold green" if confidence >= high_threshold else "yellow" if confidence >= 60 else "white"
+                conf_text = f"[{conf_color}]{confidence}%[/{conf_color}]"
+                
+                rev_text = ""
+                if revised > 0:
+                    rev_color = "bold magenta" if revised >= revised_threshold else "cyan"
+                    rev_text = f"[{rev_color}]{revised}%[/{rev_color}]"
+                
+                target_text = f"${target:.2f}" if target else "-"
             
             table.add_row(time_str, ticker, action_text, conf_text, rev_text, target_text)
         
+        # Add summary info to title
+        title = f"📈 Recent Decisions ({num_decisions}/{self.recent_limit})"
+        if use_compact:
+            title += " [Compact]"
+        
         return Panel(
             table,
-            title="📈 Recent Decisions",
+            title=title,
             border_style="green"
         )
     
@@ -247,20 +316,45 @@ class StatusDashboard:
         )
     
     def create_layout(self) -> Layout:
-        """Create the dashboard layout."""
+        """Create the dashboard layout with dynamic sizing."""
         layout = Layout()
+        
+        # Calculate dynamic sizes based on content
+        num_decisions = len(self.recent_decisions)
+        
+        # Adjust console size based on decisions panel needs
+        if num_decisions > 30:
+            # More decisions = smaller console
+            console_size = 6
+            alerts_size = 4
+        elif num_decisions > 20:
+            console_size = 7
+            alerts_size = 4
+        else:
+            # Normal layout
+            console_size = 8
+            alerts_size = 5
         
         layout.split_column(
             Layout(name="header", size=3),
             Layout(name="body"),
-            Layout(name="alerts", size=5),
-            Layout(name="console", size=8)  # Console output at bottom
+            Layout(name="alerts", size=alerts_size),
+            Layout(name="console", size=console_size)
         )
         
-        layout["body"].split_row(
-            Layout(name="left"),
-            Layout(name="right", ratio=2)
-        )
+        # Adjust body ratio based on decisions count
+        if num_decisions > 15:
+            # Give more space to decisions panel
+            layout["body"].split_row(
+                Layout(name="left", ratio=1),
+                Layout(name="right", ratio=3)  # More space for decisions
+            )
+        else:
+            # Normal ratio
+            layout["body"].split_row(
+                Layout(name="left"),
+                Layout(name="right", ratio=2)
+            )
         
         layout["left"].split_column(
             Layout(name="queue", size=10),
@@ -281,6 +375,15 @@ class StatusDashboard:
         layout["console"].update(self.create_console_panel())
         
         return layout
+    
+    def set_recent_limit(self, limit: int):
+        """Dynamically update the recent decisions limit."""
+        new_limit = max(self.min_recent, min(self.max_recent, limit))
+        if new_limit != self.recent_limit:
+            self.recent_limit = new_limit
+            # Recreate deque with new limit, preserving existing decisions
+            old_decisions = list(self.recent_decisions)
+            self.recent_decisions = deque(old_decisions[-new_limit:], maxlen=new_limit)
     
     def add_decision(self, decision: Dict[str, Any]):
         """Add a new decision to the dashboard."""

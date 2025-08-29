@@ -40,16 +40,30 @@ python llm.py --server-host localhost:1234 -v
 python test_refined_reason.py
 ```
 
+### Verify Trading Signals
+```bash
+# Verify refined signals (revised_confidence >= 70%)
+python verify.py
+
+# Custom threshold for revised_confidence (both options work)
+python verify.py --threshold 60
+python verify.py --revised-confidence 60
+
+# Limit Stooq concurrency to avoid rate limits
+export STOOQ_MAX_CONCURRENCY=1
+python verify.py --max-workers 2
+```
+
 ## Data Flow
 
 ```
 NASDAQ/SEC APIs → fetch_us_listings.py → data/us-stock-listing/us-listings-latest.json
                                                            ↓
-RSS Feeds → news_feed.py → data/news/YYMMDDHHMM.json → llm.py → data/llm/<minute>/<news_id>.json
-                ↓                                         ↑
-         data/news/.seen.db                    LM Studio Server (localhost:1234)
-                                                          ↓
-                                               data/llm/.decisions.db
+RSS Feeds → news_feed.py → data/news/YYMMDDHHMM.json → llm.py → data/trade-log/TRADE_LOG.jsonl
+                ↓                                         ↑                    ↓
+         data/news/.seen.db                    LM Studio Server      verify.py (Stooq data)
+                                                          ↓                    ↓
+                                               data/llm/.decisions.db   verification_*.json
 ```
 
 ## Environment Variables
@@ -79,6 +93,16 @@ RSS Feeds → news_feed.py → data/news/YYMMDDHHMM.json → llm.py → data/llm
 - Enriches with SEC CIK data
 - Filters test issues and non-stocks
 - Outputs both dated and latest symlinks
+
+### Signal Verification (`verify.py`)
+- Scans data/trade-log/ for all signals_*.jsonl files automatically
+- Only verifies refined signals with revised_confidence >= REVISED_CONFIDENCE_THRESHOLD (70%)
+- Skips signals without enrichment (no revised_confidence)
+- Uses Stooq for free market data (no API keys required)
+- Calculates PnL and Maximum Favorable/Adverse Excursions
+- Evaluates expected_price accuracy with hit detection
+- Outputs readable reports with emoji indicators
+- Configuration uses REVISED_CONFIDENCE_THRESHOLD from `args.py`
 
 ## Critical Requirements
 

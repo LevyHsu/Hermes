@@ -122,6 +122,36 @@ SEC_USER_AGENT = os.getenv(
 )
 
 # =====================================================================
+# DASHBOARD CONFIGURATION
+# =====================================================================
+
+# Dashboard display settings
+DASHBOARD_MIN_RECENT_DECISIONS = 10  # Minimum decisions to show
+DASHBOARD_MAX_RECENT_DECISIONS = 200  # Maximum decisions to show
+DASHBOARD_DEFAULT_RECENT_DECISIONS = 30  # Default if terminal size unknown
+DASHBOARD_CONSOLE_LOG_LINES = 15  # Number of console log lines to keep
+DASHBOARD_COMPACT_MODE_THRESHOLD = 20  # Use compact display above this many decisions
+
+# =====================================================================
+# VERIFICATION CONFIGURATION (verify.py)
+# =====================================================================
+
+# Timezone for signal timestamps
+VERIFY_TIMEZONE = "Australia/Adelaide"
+
+# Stooq data fetching configuration
+STOOQ_MAX_CONCURRENCY = int(os.getenv("STOOQ_MAX_CONCURRENCY", "2"))  # Max simultaneous Stooq requests
+STOOQ_TIMEOUT = 8.0  # Timeout for Stooq requests in seconds
+
+# Worker configuration
+VERIFY_MAX_WORKERS = min(4, (os.cpu_count() or 4))  # Max concurrent verification workers
+
+# Output configuration
+VERIFY_OUTPUT_DIR = DATA_DIR / "trade-log"  # Directory for verification output
+
+# Note: Verification uses REVISED_CONFIDENCE_THRESHOLD (70) from TRADING SIGNAL THRESHOLDS section above
+
+# =====================================================================
 # COMMAND LINE ARGUMENT PARSER
 # =====================================================================
 
@@ -302,6 +332,21 @@ Configuration Priority:
         type=int,
         default=REVISED_CONFIDENCE_THRESHOLD,
         help=f'Revised confidence threshold for logging (default: {REVISED_CONFIDENCE_THRESHOLD})'
+    )
+    
+    # Dashboard options
+    dashboard = parser.add_argument_group('Dashboard Options')
+    dashboard.add_argument(
+        '--dashboard-recent-limit',
+        type=int,
+        default=None,
+        help=f'Number of recent decisions to display (default: auto based on terminal size, min: {DASHBOARD_MIN_RECENT_DECISIONS}, max: {DASHBOARD_MAX_RECENT_DECISIONS})'
+    )
+    dashboard.add_argument(
+        '--dashboard-compact',
+        type=int,
+        default=DASHBOARD_COMPACT_MODE_THRESHOLD,
+        help=f'Threshold for compact display mode (default: {DASHBOARD_COMPACT_MODE_THRESHOLD})'
     )
     
     # Processing options

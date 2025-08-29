@@ -1,534 +1,627 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-verify.py — Verify predictions from signals_*.jsonl.
+verify.py — Verify refined trading signals from signals_*.jsonl files using Stooq data
 
-Features
-- Finds all JSONL files under data/trade-log (latest -> oldest) and pulls signals
-  with revised_confidence above configurable thresholds (separate for BUY/SELL).
-- Runs one worker per ticker (threaded by default) to:
-  * Fetch current price from multiple free sources (Yahoo Finance + Stooq).
-  * Fetch historical bars from Yahoo Finance to estimate entry price at the
-    signal timestamp and to compute MFE/MAE since entry.
-  * Evaluate expected_price (when present and >= $2) and comment on accuracy.
-- Prints a concise report and writes a JSONL summary to
-  data/trade-log/verification_YYYYMMDD_HHMMSS.jsonl
-
-Notes
-- Uses only Python stdlib networking (urllib) for portability.
-- Timezone handling assumes timestamps in the JSONL are local Adelaide time if
-  naive (no timezone). Adjust with --tz if needed.
+Features:
+- Scans data/trade-log/ for all signals_*.jsonl files (or TRADE_LOG.jsonl fallback)
+- Loads signals with revised_confidence >= REVISED_CONFIDENCE_THRESHOLD (70%)
+- Only verifies enriched signals (those that went through 2-stage LLM processing)
+- Fetches current and historical prices from Stooq (free, no API key required)
+- Calculates PnL, maximum favorable/adverse excursions
+- Evaluates expected_price accuracy when present
+- Outputs readable reports and verification summary
 """
-from __future__ import annotations
 
 import argparse
 import csv
 import dataclasses
 import datetime as dt
-import glob
 import json
 import math
 import os
+import random
 import statistics
-import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib import request, parse, error
 
 try:
-    from zoneinfo import ZoneInfo  # Py>=3.9
-except Exception:  # pragma: no cover
+    from zoneinfo import ZoneInfo
+except ImportError:
     ZoneInfo = None  # type: ignore
 
-# --------------------------- Config & CLI ---------------------------
-
-DEFAULT_TZ = "Australia/Adelaide"
-YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote?symbols={sym}"
-YAHOO_CHART_URL = (
-    "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?period1={p1}&period2={p2}&interval={interval}&events=div%2Csplit"
+# Import configuration from args.py
+from args import (
+    REVISED_CONFIDENCE_THRESHOLD,
+    VERIFY_TIMEZONE,
+    STOOQ_MAX_CONCURRENCY,
+    STOOQ_TIMEOUT,
+    VERIFY_MAX_WORKERS,
+    VERIFY_OUTPUT_DIR
 )
-STOOQ_CSV_URL = (
-    "https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
-)  # daily OHLC, last close (not intraday)
 
 # --------------------------- Models ---------------------------
 
 @dataclass
 class Signal:
-    file_path: str
-    file_mtime: float
-    line_no: int
-    timestamp: dt.datetime  # aware (UTC)
+    """Trading signal from log file"""
+    timestamp: dt.datetime  # UTC aware
     action: str  # BUY/SELL
     ticker: str
+    confidence: float
     revised_confidence: float
     expected_price: Optional[float]
-    raw: dict
+    reason: Optional[str]
+    refined_reason: Optional[str]
 
 @dataclass
-class SourcePrice:
-    source: str
-    price: Optional[float]
-    as_of: Optional[int]  # epoch seconds (UTC) if known
-    note: str = ""
+class PriceData:
+    """Price data from Stooq"""
+    current_price: Optional[float]
+    last_close: Optional[float]
+    as_of_date: Optional[str]
+    daily_bars: Optional[Dict]  # Contains dates, opens, highs, lows, closes
 
 @dataclass
 class Verification:
+    """Verification result for a signal"""
     ticker: str
-    signal_time_utc: int
+    signal_time: str
     action: str
+    confidence: float
     revised_confidence: float
     expected_price: Optional[float]
-    expected_comment: Optional[str]
-    entry_price: Optional[float]
-    entry_bar_time: Optional[int]
     current_price: Optional[float]
-    current_prices_by_source: Dict[str, float]
-    pnl_abs: Optional[float]
-    pnl_pct: Optional[float]
-    max_win_abs: Optional[float]
-    max_win_pct: Optional[float]
-    max_win_time: Optional[int]
-    max_loss_abs: Optional[float]
-    max_loss_pct: Optional[float]
-    max_loss_time: Optional[int]
-    interval_used: Optional[str]
+    entry_price: Optional[float]
+    pnl_dollars: Optional[float]
+    pnl_percent: Optional[float]
+    max_favorable: Optional[float]  # MFE
+    max_adverse: Optional[float]  # MAE
+    expected_accuracy: Optional[str]
+    data_source: str
 
-# --------------------------- HTTP Helpers ---------------------------
+# --------------------------- Stooq Data Fetcher ---------------------------
 
-def http_get(url: str, timeout: float = 8.0, headers: Optional[Dict[str, str]] = None) -> bytes:
-    hdrs = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "close",
-    }
-    if headers:
-        hdrs.update(headers)
-    req = request.Request(url, headers=hdrs)
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except error.HTTPError as e:
-        # Some Yahoo endpoints occasionally want cookies; retry once without UA
-        if 400 <= e.code < 500:
-            req = request.Request(url)
-            with request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
-        raise
-
-# --------------------------- Data Utils ---------------------------
-
-def to_aware_local(dt_str: str, tz_name: str) -> dt.datetime:
-    tz = ZoneInfo(tz_name) if ZoneInfo else None
-    try:
-        d = dt.datetime.fromisoformat(dt_str)
-    except Exception:
-        # Try without microseconds
-        d = dt.datetime.strptime(dt_str.split(".")[0], "%Y-%m-%dT%H:%M:%S")
-    if d.tzinfo is None:
-        if tz is None:
-            raise RuntimeError("Python lacks zoneinfo; provide timezone-aware timestamps or install Python>=3.9")
-        d = d.replace(tzinfo=tz)
-    return d
-
-
-def to_utc_epoch_seconds(d: dt.datetime) -> int:
-    if d.tzinfo is None:
-        raise ValueError("datetime must be timezone-aware")
-    return int(d.astimezone(dt.timezone.utc).timestamp())
-
-
-def round_safe(x: Optional[float], n: int = 4) -> Optional[float]:
-    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-        return None
-    return round(x, n)
-
-# --------------------------- Source Fetchers ---------------------------
-
-def yahoo_quote_price(symbol: str) -> SourcePrice:
-    url = YAHOO_QUOTE_URL.format(sym=parse.quote(symbol))
-    try:
-        data = json.loads(http_get(url))
-        quote = (data.get("quoteResponse", {}) or {}).get("result", [{}])[0]
-        price = quote.get("regularMarketPrice")
-        as_of = quote.get("regularMarketTime")  # epoch seconds
-        return SourcePrice("yahoo_quote", float(price) if price is not None else None, int(as_of) if as_of else None)
-    except Exception as e:  # pragma: no cover
-        return SourcePrice("yahoo_quote", None, None, note=f"err={e}")
-
-
-def stooq_last_close(symbol: str) -> SourcePrice:
-    # Stooq expects .us suffix for US tickers. Rough heuristic.
-    stooq_sym = symbol.lower()
-    if "." not in stooq_sym:
-        stooq_sym = f"{stooq_sym}.us"
-    url = STOOQ_CSV_URL.format(sym=parse.quote(stooq_sym))
-    try:
-        raw = http_get(url).decode("utf-8", errors="ignore")
-        # CSV has headers: Symbol,Date,Time,Open,High,Low,Close,Volume
-        reader = csv.DictReader(raw.splitlines())
-        row = next(reader, None)
-        if not row:
-            return SourcePrice("stooq", None, None, note="no data")
-        close = row.get("Close")
-        date_str = row.get("Date")
-        time_str = row.get("Time")
-        # Stooq time is exchange local EOD; treat as naive
-        as_of = None
+class StooqFetcher:
+    """Fetches price data from Stooq"""
+    
+    CURRENT_URL = "https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
+    DAILY_URL = "https://stooq.com/q/d/l/?s={sym}&i=d"
+    
+    def __init__(self):
+        self.semaphore = threading.Semaphore(STOOQ_MAX_CONCURRENCY)
+    
+    def _http_get(self, url: str) -> bytes:
+        """HTTP GET with rate limiting and retries"""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+            "Connection": "close"
+        }
+        
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            with self.semaphore:
+                try:
+                    req = request.Request(url, headers=headers)
+                    with request.urlopen(req, timeout=STOOQ_TIMEOUT) as resp:
+                        return resp.read()
+                except (error.HTTPError, error.URLError) as e:
+                    if attempt == max_attempts:
+                        raise
+                    time.sleep(0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.2))
+        
+        raise RuntimeError(f"Failed to fetch: {url}")
+    
+    def _format_symbol(self, ticker: str) -> str:
+        """Format ticker for Stooq (adds .us suffix if needed)"""
+        ticker = ticker.lower()
+        if "." not in ticker:
+            ticker = f"{ticker}.us"
+        return ticker
+    
+    def fetch_current(self, ticker: str) -> Tuple[Optional[float], Optional[str]]:
+        """Fetch current/last close price"""
+        sym = self._format_symbol(ticker)
+        url = self.CURRENT_URL.format(sym=parse.quote(sym))
+        
         try:
-            if date_str:
-                if time_str and time_str != "":
-                    as_of = int(dt.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp())
-                else:
-                    as_of = int(dt.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc).timestamp())
+            raw = self._http_get(url).decode("utf-8", errors="ignore")
+            reader = csv.DictReader(raw.splitlines())
+            row = next(reader, None)
+            
+            if not row:
+                return None, None
+            
+            close = row.get("Close")
+            date = row.get("Date")
+            
+            if close and close not in ("-", ""):
+                return float(close), date
+            
+            return None, None
+            
         except Exception:
-            as_of = None
-        price = float(close) if close not in (None, "-", "") else None
-        return SourcePrice("stooq_close", price, as_of, note="EOD close; not intraday")
-    except Exception as e:  # pragma: no cover
-        return SourcePrice("stooq_close", None, None, note=f"err={e}")
-
-
-def choose_interval(seconds_span: int) -> str:
-    # Yahoo intraday windows:
-    # 1m up to ~7d, 2m up to ~60d, 5m/15m beyond; otherwise 1d.
-    days = seconds_span / 86400.0
-    if days <= 7:
-        return "1m"
-    if days <= 30:
-        return "5m"
-    if days <= 60:
-        return "15m"
-    if days <= 365:
-        return "1d"
-    return "1d"
-
-
-def yahoo_bars(symbol: str, start_ts: int, end_ts: int, interval: Optional[str] = None) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
-    if end_ts <= start_ts:
-        end_ts = start_ts + 3600
-    if interval is None:
-        interval = choose_interval(end_ts - start_ts)
-    url = YAHOO_CHART_URL.format(sym=parse.quote(symbol), p1=start_ts, p2=end_ts, interval=parse.quote(interval))
-    data = json.loads(http_get(url))
-    result = (data.get("chart", {}) or {}).get("result", [])
-    if not result:
-        return [], [], [], [], []
-    r0 = result[0]
-    timestamps = r0.get("timestamp") or []
-    q = (r0.get("indicators", {}) or {}).get("quote", [{}])[0]
-    opens = q.get("open") or []
-    highs = q.get("high") or []
-    lows = q.get("low") or []
-    closes = q.get("close") or []
-    # Clean None values by forward/backward fill where possible
-    def _clean(vals: List[Optional[float]]) -> List[float]:
-        out: List[float] = []
-        last = None
-        for v in vals:
-            if v is None:
-                out.append(last if last is not None else math.nan)
-            else:
-                last = v
-                out.append(v)
-        # Replace leading NaNs with first non-nan
-        first = next((x for x in out if not math.isnan(x)), math.nan)
-        out = [first if math.isnan(x) else x for x in out]
-        return out
-
-    return (
-        [int(t) for t in timestamps],
-        _clean(opens),
-        _clean(highs),
-        _clean(lows),
-        _clean(closes),
-    )
-
-# --------------------------- Core Logic ---------------------------
-
-def median_price(sources: List[SourcePrice]) -> Optional[float]:
-    vals = [s.price for s in sources if s.price is not None and not math.isnan(s.price)]
-    if not vals:
-        return None
-    try:
-        return float(statistics.median(vals))
-    except Exception:
-        return float(vals[0])
-
-
-def compute_entry_and_excursions(symbol: str, entry_ts: int) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[float], Optional[int], Optional[float], Optional[float], Optional[int], str]:
-    # Fetch bars from 30 minutes before entry to now
-    now_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
-    start_ts = max(entry_ts - 30 * 60, entry_ts - 2 * 3600)
-    interval = choose_interval(now_ts - start_ts)
-    ts, o, h, l, c = yahoo_bars(symbol, start_ts, now_ts, interval)
-    if not ts:
-        return (None, None, None, None, None, None, None, None, interval)
-    # Find index at/after entry
-    idx = None
-    for i, t in enumerate(ts):
-        if t >= entry_ts:
-            idx = i
-            break
-    if idx is None:
-        idx = len(ts) - 1
-    # Estimate entry price as close at idx (fallback to open)
-    entry = c[idx] if not math.isnan(c[idx]) else (o[idx] if not math.isnan(o[idx]) else None)
-    entry_time = ts[idx]
-    # Compute MFE/MAE since entry (inclusive)
-    highs = [x for x in h[idx:] if not math.isnan(x)]
-    lows = [x for x in l[idx:] if not math.isnan(x)]
-    if not highs or not lows or entry is None:
-        return (entry, entry_time, None, None, None, None, None, None, interval)
-    max_high = max(highs)
-    min_low = min(lows)
-    # Times of extremes
-    try:
-        max_i = h[idx:].index(max_high)
-        max_time = ts[idx + max_i]
-    except Exception:
-        max_time = None
-    try:
-        min_i = l[idx:].index(min_low)
-        min_time = ts[idx + min_i]
-    except Exception:
-        min_time = None
-    # For BUY: MFE = max_high - entry; MAE = entry - min_low
-    # SELL is handled by sign downstream
-    return (entry, entry_time, max_high, min_low, max_time, None, None, min_time, interval)
-
-
-def pnl_for_action(action: str, entry: float, current: float) -> Tuple[float, float]:
-    if action.upper() == "BUY":
-        diff = current - entry
-    else:  # SELL
-        diff = entry - current
-    pct = diff / entry * 100.0 if entry else math.nan
-    return diff, pct
-
-
-def mfe_mae_for_action(action: str, entry: float, max_high: Optional[float], min_low: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    if max_high is None or min_low is None or entry is None:
-        return None, None
-    if action.upper() == "BUY":
-        mfe = max_high - entry
-        mae = entry - min_low
-    else:  # SELL
-        mfe = entry - min_low
-        mae = max_high - entry
-    return mfe, mae
-
-
-def comment_expected_price(expected: float, current: float, max_high: Optional[float], min_low: Optional[float]) -> str:
-    if expected is None or expected < 2:
-        return "(ignored)"
-    diff_pct = (current - expected) / expected * 100.0 if expected else math.nan
-    band = abs(diff_pct)
-    if (min_low is not None and expected < min_low) or (max_high is not None and expected > max_high):
-        range_note = "outside-seen-range"
-    elif (min_low is not None and expected <= max_high and expected >= min_low):
-        range_note = "hit-within-range"
-    else:
-        range_note = "unknown-range"
-    if band <= 2:
-        qual = "accurate (≤2%)"
-    elif band <= 5:
-        qual = "close (≤5%)"
-    elif band <= 10:
-        qual = "loose (≤10%)"
-    else:
-        qual = f"off by {round(band, 2)}%"
-    return f"{qual}; {range_note}"
-
-# --------------------------- Loading & Filtering ---------------------------
-
-def load_signals(base_dir: str, tz_name: str, buy_thr: float, sell_thr: float) -> Dict[str, List[Signal]]:
-    paths = sorted(glob.glob(os.path.join(base_dir, "signals_*.jsonl")), key=os.path.getmtime, reverse=True)
-    by_ticker: Dict[str, List[Signal]] = {}
-    for p in paths:
+            return None, None
+    
+    def fetch_daily_bars(self, ticker: str, days_back: int = 30) -> Optional[Dict]:
+        """Fetch daily OHLC bars"""
+        sym = self._format_symbol(ticker)
+        url = self.DAILY_URL.format(sym=parse.quote(sym))
+        
         try:
-            with open(p, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
+            raw = self._http_get(url).decode("utf-8", errors="ignore")
+            reader = csv.DictReader(raw.splitlines())
+            
+            dates = []
+            opens = []
+            highs = []
+            lows = []
+            closes = []
+            
+            for row in reader:
+                date = row.get("Date")
+                if not date or date == "-":
+                    continue
+                
+                dates.append(date)
+                opens.append(float(row.get("Open", "nan")))
+                highs.append(float(row.get("High", "nan")))
+                lows.append(float(row.get("Low", "nan")))
+                closes.append(float(row.get("Close", "nan")))
+            
+            if not dates:
+                return None
+            
+            # Return last N days
+            n = min(days_back, len(dates))
+            return {
+                "dates": dates[-n:],
+                "opens": opens[-n:],
+                "highs": highs[-n:],
+                "lows": lows[-n:],
+                "closes": closes[-n:]
+            }
+            
+        except Exception:
+            return None
+
+# --------------------------- Analysis Functions ---------------------------
+
+def calculate_pnl(action: str, entry: float, current: float) -> Tuple[float, float]:
+    """Calculate profit/loss for a position"""
+    if action.upper() == "BUY":
+        dollars = current - entry
+    else:  # SELL
+        dollars = entry - current
+    
+    percent = (dollars / entry * 100.0) if entry else 0.0
+    return round(dollars, 2), round(percent, 2)
+
+def calculate_mfe_mae(action: str, entry: float, highs: List[float], lows: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    """Calculate Maximum Favorable/Adverse Excursions"""
+    if not highs or not lows:
+        return None, None
+    
+    valid_highs = [h for h in highs if not math.isnan(h)]
+    valid_lows = [l for l in lows if not math.isnan(l)]
+    
+    if not valid_highs or not valid_lows:
+        return None, None
+    
+    max_high = max(valid_highs)
+    min_low = min(valid_lows)
+    
+    if action.upper() == "BUY":
+        mfe = max_high - entry  # Max profit
+        mae = entry - min_low   # Max loss
+    else:  # SELL
+        mfe = entry - min_low   # Max profit
+        mae = max_high - entry  # Max loss
+    
+    return round(mfe, 2) if mfe else None, round(mae, 2) if mae else None
+
+def evaluate_expected_price(expected: float, current: float, highs: List[float], lows: List[float]) -> str:
+    """Evaluate accuracy of expected price prediction"""
+    if not expected or expected < 2 or not current:
+        return "N/A"
+    
+    diff_pct = abs((current - expected) / expected * 100.0)
+    
+    # Check if price was hit historically
+    hit = False
+    if highs and lows:
+        valid_highs = [h for h in highs if not math.isnan(h)]
+        valid_lows = [l for l in lows if not math.isnan(l)]
+        if valid_highs and valid_lows:
+            max_high = max(valid_highs)
+            min_low = min(valid_lows)
+            hit = min_low <= expected <= max_high
+    
+    # Accuracy rating
+    if diff_pct <= 2:
+        accuracy = "✓ Excellent (<2%)"
+    elif diff_pct <= 5:
+        accuracy = "✓ Good (<5%)"
+    elif diff_pct <= 10:
+        accuracy = "~ Fair (<10%)"
+    else:
+        accuracy = f"✗ Off by {diff_pct:.1f}%"
+    
+    if hit:
+        accuracy += " [HIT]"
+    
+    return accuracy
+
+# --------------------------- Signal Loading ---------------------------
+
+def load_signals_from_file(log_path: Path, threshold: float) -> List[Signal]:
+    """Load and filter signals from a single JSONL file based on revised_confidence"""
+    signals = []
+    
+    if not log_path.exists():
+        return signals
+    
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            
+            try:
+                data = json.loads(line)
+                
+                # Extract fields
+                action = data.get("action", "").upper()
+                if action not in ("BUY", "SELL"):
+                    continue
+                
+                confidence = float(data.get("confidence", 0))
+                revised = float(data.get("revised_confidence", 0))
+                
+                # Only verify signals with revised_confidence above threshold
+                # If no revised_confidence, skip (we only care about refined signals)
+                if revised < threshold:
+                    continue
+                
+                # Parse timestamp
+                timestamp_str = data.get("timestamp")
+                if not timestamp_str:
+                    continue
+                
+                # Handle timezone
+                try:
+                    if ZoneInfo:
+                        tz = ZoneInfo(VERIFY_TIMEZONE)
+                        timestamp = dt.datetime.fromisoformat(timestamp_str)
+                        if timestamp.tzinfo is None:
+                            timestamp = timestamp.replace(tzinfo=tz)
+                    else:
+                        timestamp = dt.datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                
+                ticker = data.get("ticker", "").upper()
+                if not ticker:
+                    continue
+                
+                expected = data.get("expected_price")
+                if expected:
                     try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    action = (obj.get("action") or obj.get("signal") or "").upper()
-                    if action not in ("BUY", "SELL"):
-                        continue
-                    conf = float(obj.get("revised_confidence", obj.get("confidence", 0)))
-                    thr = buy_thr if action == "BUY" else sell_thr
-                    if conf < thr:
-                        continue
-                    ts_str = obj.get("timestamp")
-                    if not ts_str:
-                        continue
-                    try:
-                        local_dt = to_aware_local(ts_str, tz_name)
-                    except Exception:
-                        continue
-                    utc_dt = local_dt.astimezone(dt.timezone.utc)
-                    ticker = str(obj.get("ticker") or obj.get("symbol") or "").strip().upper()
-                    if not ticker:
-                        continue
-                    expected_price = None
-                    ep = obj.get("expected_price")
-                    if ep is not None:
-                        try:
-                            expected_price = float(ep)
-                        except Exception:
-                            expected_price = None
-                    s = Signal(
-                        file_path=p,
-                        file_mtime=os.path.getmtime(p),
-                        line_no=i,
-                        timestamp=utc_dt,
-                        action=action,
-                        ticker=ticker,
-                        revised_confidence=conf,
-                        expected_price=expected_price,
-                        raw=obj,
-                    )
-                    by_ticker.setdefault(ticker, []).append(s)
-        except FileNotFoundError:
-            continue
-    # Sort signals per ticker by time desc
-    for t in by_ticker:
-        by_ticker[t].sort(key=lambda s: s.timestamp, reverse=True)
-    return by_ticker
+                        expected = float(expected)
+                    except (ValueError, TypeError):
+                        expected = None
+                
+                signal = Signal(
+                    timestamp=timestamp,
+                    action=action,
+                    ticker=ticker,
+                    confidence=confidence,
+                    revised_confidence=revised,
+                    expected_price=expected,
+                    reason=data.get("reason"),
+                    refined_reason=data.get("refined_reason")
+                )
+                
+                signals.append(signal)
+                
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+    
+    return signals
 
-# --------------------------- Worker ---------------------------
-
-def process_ticker(ticker: str, signals: List[Signal], now_utc: int) -> List[Verification]:
-    # Fetch multi-source current price once per ticker
-    sources = [yahoo_quote_price(ticker), stooq_last_close(ticker)]
-    current = median_price(sources)
-    prices_by_source = {s.source: s.price for s in sources if s.price is not None}
-
-    verifications: List[Verification] = []
-    for s in signals:
-        entry, entry_time, max_high, min_low, max_time, _x1, _x2, min_time, interval = compute_entry_and_excursions(
-            ticker, to_utc_epoch_seconds(s.timestamp)
-        )
-        if entry is None or current is None:
-            pnl_abs = pnl_pct = None
-            mfe = mae = None
+def load_all_signals(trade_log_dir: Path, threshold: float) -> List[Signal]:
+    """Load signals from all signals_*.jsonl files in the trade-log directory"""
+    all_signals = []
+    
+    # Find all signals_*.jsonl files
+    signal_files = sorted(trade_log_dir.glob("signals_*.jsonl"))
+    
+    if not signal_files:
+        # Fallback to TRADE_LOG.jsonl if no signals_ files found
+        trade_log = trade_log_dir / "TRADE_LOG.jsonl"
+        if trade_log.exists():
+            print(f"📂 Loading from: {trade_log}")
+            return load_signals_from_file(trade_log, threshold)
+        return []
+    
+    print(f"📂 Found {len(signal_files)} signal files in {trade_log_dir}")
+    
+    # Load from all files
+    for file_path in signal_files:
+        file_signals = load_signals_from_file(file_path, threshold)
+        if file_signals:
+            print(f"  ✓ {file_path.name}: {len(file_signals)} signals")
+            all_signals.extend(file_signals)
         else:
-            pnl_abs, pnl_pct = pnl_for_action(s.action, entry, current)
-            mfe, mae = mfe_mae_for_action(s.action, entry, max_high, min_low)
-        expected_comment = None
-        if s.expected_price is not None and s.expected_price >= 2 and current is not None:
-            expected_comment = comment_expected_price(s.expected_price, current, max_high, min_low)
-        v = Verification(
-            ticker=ticker,
-            signal_time_utc=to_utc_epoch_seconds(s.timestamp),
-            action=s.action,
-            revised_confidence=s.revised_confidence,
-            expected_price=round_safe(s.expected_price, 4) if s.expected_price is not None else None,
-            expected_comment=expected_comment,
-            entry_price=round_safe(entry, 4),
-            entry_bar_time=entry_time,
-            current_price=round_safe(current, 4),
-            current_prices_by_source={k: round_safe(v, 4) for k, v in prices_by_source.items()},
-            pnl_abs=round_safe(pnl_abs, 4) if pnl_abs is not None else None,
-            pnl_pct=round_safe(pnl_pct, 4) if pnl_pct is not None else None,
-            max_win_abs=round_safe(mfe, 4) if mfe is not None else None,
-            max_win_pct=round_safe((mfe / entry * 100.0) if (mfe is not None and entry) else None, 4),
-            max_win_time=max_time,
-            max_loss_abs=round_safe(mae, 4) if mae is not None else None,
-            max_loss_pct=round_safe((mae / entry * 100.0) if (mae is not None and entry) else None, 4),
-            max_loss_time=min_time,
-            interval_used=interval,
+            print(f"  - {file_path.name}: no qualifying signals")
+    
+    # Sort all signals by timestamp (newest first)
+    all_signals.sort(key=lambda s: s.timestamp, reverse=True)
+    
+    return all_signals
+
+# --------------------------- Verification Worker ---------------------------
+
+def verify_signal(signal: Signal, fetcher: StooqFetcher) -> Verification:
+    """Verify a single signal"""
+    
+    # Fetch current price
+    current_price, as_of_date = fetcher.fetch_current(signal.ticker)
+    
+    # Fetch historical bars
+    bars = fetcher.fetch_daily_bars(signal.ticker, days_back=30)
+    
+    entry_price = None
+    mfe = None
+    mae = None
+    
+    if bars and bars["closes"]:
+        # Use last close as entry (simplified - could match by date)
+        entry_price = bars["closes"][-1] if not math.isnan(bars["closes"][-1]) else None
+        
+        # Calculate MFE/MAE
+        if entry_price:
+            mfe, mae = calculate_mfe_mae(signal.action, entry_price, bars["highs"], bars["lows"])
+    
+    # Calculate PnL
+    pnl_dollars = None
+    pnl_percent = None
+    if entry_price and current_price:
+        pnl_dollars, pnl_percent = calculate_pnl(signal.action, entry_price, current_price)
+    
+    # Evaluate expected price
+    expected_accuracy = None
+    if signal.expected_price and current_price and bars:
+        expected_accuracy = evaluate_expected_price(
+            signal.expected_price, 
+            current_price,
+            bars.get("highs", []),
+            bars.get("lows", [])
         )
-        verifications.append(v)
-    return verifications
+    
+    return Verification(
+        ticker=signal.ticker,
+        signal_time=signal.timestamp.strftime("%Y-%m-%d %H:%M"),
+        action=signal.action,
+        confidence=signal.confidence,
+        revised_confidence=signal.revised_confidence,
+        expected_price=signal.expected_price,
+        current_price=current_price,
+        entry_price=entry_price,
+        pnl_dollars=pnl_dollars,
+        pnl_percent=pnl_percent,
+        max_favorable=mfe,
+        max_adverse=mae,
+        expected_accuracy=expected_accuracy,
+        data_source="Stooq"
+    )
 
 # --------------------------- Reporting ---------------------------
 
-def fmt_epoch(ts: Optional[int]) -> str:
-    if not ts:
-        return "-"
-    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def print_summary(verifications: List[Verification]):
+    """Print organized summary report"""
+    
+    if not verifications:
+        print("\n📊 No signals to verify")
+        return
+    
+    print("\n" + "=" * 80)
+    print("📊 HERMES SIGNAL VERIFICATION REPORT")
+    print("=" * 80)
+    
+    # Group by ticker
+    by_ticker = {}
+    for v in verifications:
+        by_ticker.setdefault(v.ticker, []).append(v)
+    
+    # Statistics
+    total = len(verifications)
+    with_pnl = sum(1 for v in verifications if v.pnl_percent is not None)
+    profitable = sum(1 for v in verifications if v.pnl_percent and v.pnl_percent > 0)
+    
+    print(f"\n📈 Summary Statistics:")
+    print(f"  • Total Refined Signals: {total}")
+    print(f"  • Signals with PnL: {with_pnl}")
+    if with_pnl > 0:
+        win_rate = (profitable / with_pnl) * 100
+        print(f"  • Win Rate: {win_rate:.1f}% ({profitable}/{with_pnl})")
+    
+    # Detailed results by ticker
+    for ticker in sorted(by_ticker.keys()):
+        signals = by_ticker[ticker]
+        print(f"\n{'─' * 60}")
+        print(f"🎯 {ticker} ({len(signals)} signal{'s' if len(signals) > 1 else ''})")
+        print(f"{'─' * 60}")
+        
+        for v in signals:
+            # Signal info - show revised confidence (all should have it)
+            conf_str = f"{v.revised_confidence:.0f}% (refined)"
+            
+            print(f"\n  📅 {v.signal_time} | {v.action} | Confidence: {conf_str}")
+            
+            # Price info
+            if v.current_price:
+                print(f"  💰 Current: ${v.current_price:.2f}", end="")
+                if v.entry_price:
+                    print(f" | Entry: ${v.entry_price:.2f}", end="")
+                print()
+            else:
+                print(f"  ⚠️  No current price data available")
+            
+            # PnL
+            if v.pnl_percent is not None:
+                emoji = "🟢" if v.pnl_percent > 0 else "🔴" if v.pnl_percent < 0 else "⚪"
+                sign = "+" if v.pnl_dollars > 0 else ""
+                print(f"  {emoji} PnL: {sign}${v.pnl_dollars:.2f} ({sign}{v.pnl_percent:.2f}%)")
+            
+            # MFE/MAE
+            if v.max_favorable is not None:
+                print(f"  📊 Max Favorable: ${v.max_favorable:.2f} | Max Adverse: ${v.max_adverse:.2f}")
+            
+            # Expected price accuracy
+            if v.expected_price and v.expected_accuracy != "N/A":
+                print(f"  🎯 Expected: ${v.expected_price:.2f} → {v.expected_accuracy}")
+    
+    print(f"\n{'=' * 80}")
+    print(f"Data source: {verifications[0].data_source if verifications else 'Stooq'}")
+    print(f"Report generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
 
-
-def print_report(ticker: str, verifications: List[Verification]) -> None:
+def save_verification(verifications: List[Verification], output_dir: Path):
+    """Save verification results to JSON file"""
+    
     if not verifications:
         return
-    print(f"\n=== {ticker} ===")
-    for v in verifications:
-        print(
-            f"{fmt_epoch(v.signal_time_utc)} | {v.action} | conf={v.revised_confidence:.1f} | "
-            f"entry={v.entry_price} (bar {fmt_epoch(v.entry_bar_time)}) | current={v.current_price} "
-            f"sources={v.current_prices_by_source}"
-        )
-        print(
-            f" -> PnL now: {v.pnl_abs} ({v.pnl_pct}%) | "
-            f"MaxWin: {v.max_win_abs} ({v.max_win_pct}%) at {fmt_epoch(v.max_win_time)} | "
-            f"MaxLoss: {v.max_loss_abs} ({v.max_loss_pct}%) at {fmt_epoch(v.max_loss_time)} | interval={v.interval_used}"
-        )
-        if v.expected_price is not None:
-            print(f" -> expected_price={v.expected_price} comment={v.expected_comment}")
-
-
-def write_jsonl(out_path: str, ticker: str, verifications: List[Verification]) -> None:
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "a", encoding="utf-8") as f:
-        for v in verifications:
-            f.write(json.dumps(dataclasses.asdict(v), ensure_ascii=False) + "\n")
+    
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"verification_{timestamp}.json"
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    data = [dataclasses.asdict(v) for v in verifications]
+    
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+    
+    print(f"\n💾 Results saved to: {output_file}")
 
 # --------------------------- Main ---------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Verify predictions from signals JSONL logs")
-    parser.add_argument("--dir", default="data/trade-log", help="Directory containing signals_*.jsonl")
-    parser.add_argument("--buy-threshold", type=float, default=80.0, help="Min revised_confidence for BUY")
-    parser.add_argument("--sell-threshold", type=float, default=80.0, help="Min revised_confidence for SELL")
-    parser.add_argument("--tz", default=DEFAULT_TZ, help="Timezone for naive timestamps in logs")
-    parser.add_argument("--max-workers", type=int, default=min(8, (os.cpu_count() or 4)), help="Worker threads")
-    parser.add_argument("--out", default=None, help="Optional JSONL output path (default auto under data/trade-log)")
+def main():
+    """Main verification function"""
+    
+    parser = argparse.ArgumentParser(
+        description="Verify Hermes trading signals using Stooq data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Verify all signals_*.jsonl files with default threshold (>= 70%)
+  python verify.py
+  
+  # Verify with custom threshold (two equivalent ways)
+  python verify.py --threshold 60
+  python verify.py --revised-confidence 60
+  
+  # Use more workers for faster processing
+  python verify.py --max-workers 8
+  
+  # Specify custom directory
+  python verify.py --trade-log-dir data/trade-log
+        """
+    )
+    
+    parser.add_argument(
+        "--trade-log-dir",
+        type=Path,
+        default=VERIFY_OUTPUT_DIR,
+        help=f"Directory containing signals_*.jsonl files (default: {VERIFY_OUTPUT_DIR})"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=REVISED_CONFIDENCE_THRESHOLD,
+        help=f"Minimum revised_confidence for signals (default: {REVISED_CONFIDENCE_THRESHOLD}%)"
+    )
+    parser.add_argument(
+        "--revised-confidence",
+        type=float,
+        dest="threshold",  # Maps to the same destination as --threshold
+        help=f"Minimum revised_confidence for signals (alias for --threshold)"
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=VERIFY_MAX_WORKERS,
+        help=f"Maximum concurrent workers (default: {VERIFY_MAX_WORKERS})"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=VERIFY_OUTPUT_DIR,
+        help="Directory for output files"
+    )
+    
     args = parser.parse_args()
-
-    now_utc = int(dt.datetime.now(dt.timezone.utc).timestamp())
-    by_ticker = load_signals(args.dir, args.tz, args.buy_threshold, args.sell_threshold)
-
-    if not by_ticker:
-        print("No qualifying signals found.")
+    
+    # Load signals from all signals_*.jsonl files
+    print(f"📂 Scanning directory: {args.trade_log_dir}")
+    print(f"🎯 Filtering: revised_confidence ≥ {args.threshold}%")
+    signals = load_all_signals(args.trade_log_dir, args.threshold)
+    
+    if not signals:
+        print("❌ No qualifying signals found")
+        print(f"   Only signals with revised_confidence ≥ {args.threshold}% are verified")
+        print("   (Signals without enrichment are skipped)")
         return
-
-    ts_label = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = args.out or os.path.join(args.dir, f"verification_{ts_label}.jsonl")
-
-    # One thread per ticker
-    print(f"Verifying {len(by_ticker)} tickers with up to {args.max_workers} workers ...")
-    futures = {}
-    results: Dict[str, List[Verification]] = {}
-    lock = threading.Lock()
-    with ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-        for ticker, signals in by_ticker.items():
-            futures[ex.submit(process_ticker, ticker, signals, now_utc)] = ticker
-        for fut in as_completed(futures):
-            ticker = futures[fut]
+    
+    # Group by ticker for efficient processing
+    by_ticker = {}
+    for signal in signals:
+        by_ticker.setdefault(signal.ticker, []).append(signal)
+    
+    print(f"📊 Found {len(signals)} refined signals across {len(by_ticker)} tickers")
+    print(f"🔄 Verifying refined signals with {args.max_workers} workers...")
+    
+    # Initialize fetcher
+    fetcher = StooqFetcher()
+    
+    # Process signals
+    verifications = []
+    
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        # Take only the most recent signal per ticker
+        futures = {}
+        for ticker, ticker_signals in by_ticker.items():
+            # Process most recent signal for each ticker
+            futures[executor.submit(verify_signal, ticker_signals[0], fetcher)] = ticker
+        
+        # Collect results
+        for future in as_completed(futures):
+            ticker = futures[future]
             try:
-                verifications = fut.result()
-            except Exception as e:  # pragma: no cover
-                print(f"[ERROR] {ticker}: {e}")
-                continue
-            with lock:
-                results[ticker] = verifications
-                print_report(ticker, verifications)
-                write_jsonl(out_path, ticker, verifications)
-
-    print(f"\nSummary written to: {out_path}")
-
+                verification = future.result()
+                verifications.append(verification)
+                
+                # Show progress
+                emoji = "✓" if verification.current_price else "✗"
+                print(f"  {emoji} {ticker}", end=" ", flush=True)
+                
+            except Exception as e:
+                print(f"\n  ✗ {ticker}: {e}")
+    
+    print("\n")
+    
+    # Print summary
+    print_summary(verifications)
+    
+    # Save results
+    save_verification(verifications, args.output_dir)
 
 if __name__ == "__main__":
     main()

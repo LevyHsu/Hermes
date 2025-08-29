@@ -12,6 +12,8 @@ import signal
 import sys
 import time
 import threading
+import os
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -34,6 +36,7 @@ TRADE_LOG_DIR = DATA_DIR / "trade-log"
 LISTING_DIR = DATA_DIR / "us-stock-listing"
 LOGS_DIR = Path("logs")
 
+
 # Global resources
 STOP = False
 LLM_CLIENT = None
@@ -41,6 +44,46 @@ HARVESTER_THREAD = None
 PROCESSOR_THREAD = None
 NEWS_QUEUE = None
 DASHBOARD = None
+
+
+# Helper to compute dashboard recent limit
+def _calc_recent_limit(args=None) -> int:
+    """
+    Compute how many rows the 'Recent Decisions' panel should try to show.
+    Priority:
+      1) Command-line argument: --dashboard-recent-limit
+      2) Env override: DASHBOARD_RECENT_LIMIT
+      3) Terminal height derived: rows - 15 (for header/footer/other panels)
+      4) Fallback: DASHBOARD_DEFAULT_RECENT_DECISIONS from args.py
+    """
+    from args import (
+        DASHBOARD_MIN_RECENT_DECISIONS, 
+        DASHBOARD_MAX_RECENT_DECISIONS, 
+        DASHBOARD_DEFAULT_RECENT_DECISIONS
+    )
+    
+    # Check command-line argument first
+    if args and hasattr(args, 'dashboard_recent_limit') and args.dashboard_recent_limit:
+        return max(DASHBOARD_MIN_RECENT_DECISIONS, min(DASHBOARD_MAX_RECENT_DECISIONS, args.dashboard_recent_limit))
+    
+    # Check environment variable override
+    env = os.environ.get("DASHBOARD_RECENT_LIMIT")
+    if env:
+        try:
+            return max(DASHBOARD_MIN_RECENT_DECISIONS, min(DASHBOARD_MAX_RECENT_DECISIONS, int(env)))
+        except Exception:
+            pass
+    
+    # Calculate based on terminal size
+    try:
+        size = shutil.get_terminal_size(fallback=(120, 40))
+        # Reserve space for header(3) + queue/stats + alerts(5) + console(8) = ~15 lines
+        available = size.lines - 15
+        # Allocate about 60% of available space to decisions panel
+        decision_lines = int(available * 0.6)
+        return max(DASHBOARD_MIN_RECENT_DECISIONS, min(DASHBOARD_MAX_RECENT_DECISIONS, decision_lines))
+    except Exception:
+        return DASHBOARD_DEFAULT_RECENT_DECISIONS
 
 
 def handle_signal(signum, frame):
@@ -55,10 +98,9 @@ def handle_signal(signum, frame):
         if DASHBOARD:
             DASHBOARD.stop()
             
-        # Close LLM client if it exists
+        # LMStudioClient doesn't need explicit cleanup (uses HTTP internally)
         if LLM_CLIENT:
-            logging.info("Closing LLM client connection...")
-            LLM_CLIENT.close()
+            logging.info("LLM client cleanup completed")
             
     except Exception as e:
         logging.error(f"Error during shutdown: {e}")
@@ -599,7 +641,27 @@ def main():
     # Initialize dashboard if not in quiet mode
     if not args.quiet and sys.stdout.isatty():
         logging.info("Initializing status dashboard...")
-        DASHBOARD = StatusDashboard(queue=NEWS_QUEUE)
+        recent_limit = _calc_recent_limit(args)
+        # Try multiple constructor signatures (recent_limit vs max_recent)
+        try:
+            DASHBOARD = StatusDashboard(queue=NEWS_QUEUE, recent_limit=recent_limit)
+        except TypeError:
+            try:
+                DASHBOARD = StatusDashboard(queue=NEWS_QUEUE, max_recent=recent_limit)
+            except TypeError:
+                DASHBOARD = StatusDashboard(queue=NEWS_QUEUE)
+                # Best-effort post-init configuration if supported
+                if hasattr(DASHBOARD, "set_recent_limit"):
+                    try:
+                        DASHBOARD.set_recent_limit(recent_limit)
+                    except Exception:
+                        pass
+                elif hasattr(DASHBOARD, "recent_limit"):
+                    try:
+                        setattr(DASHBOARD, "recent_limit", recent_limit)
+                    except Exception:
+                        pass
+        logging.info(f"Status dashboard recent list capacity set to ~{recent_limit} rows")
         DASHBOARD.run()
     
     # Start threads
@@ -659,14 +721,9 @@ def main():
         stats = NEWS_QUEUE.get_stats()
         logging.info(f"Final queue stats: {stats}")
         
-    # Close LLM client
+    # LMStudioClient doesn't need explicit cleanup (uses HTTP internally)
     if LLM_CLIENT:
-        try:
-            logging.info("Closing LLM client...")
-            LLM_CLIENT.close()
-            logging.info("LLM client closed")
-        except Exception as e:
-            logging.error(f"Error closing LLM: {e}")
+        logging.info("LLM client cleanup completed")
             
     logging.info("="*60)
     
