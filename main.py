@@ -548,6 +548,9 @@ def log_trading_signals(results: List[Dict], minute_key: str, args):
                         
                     if decision.get('entry_price'):
                         signal['entry_price'] = decision['entry_price']
+                    
+                    if decision.get('current_price'):
+                        signal['current_price'] = decision['current_price']
                         
                     if decision.get('refined_reason'):
                         signal['refined_reason'] = decision.get('refined_reason', '')[:500]
