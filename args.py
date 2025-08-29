@@ -122,6 +122,25 @@ SEC_USER_AGENT = os.getenv(
 )
 
 # =====================================================================
+# VERIFICATION CONFIGURATION (verify.py)
+# =====================================================================
+
+# Timezone for signal timestamps
+VERIFY_TIMEZONE = "Australia/Adelaide"
+
+# Stooq data fetching configuration
+STOOQ_MAX_CONCURRENCY = int(os.getenv("STOOQ_MAX_CONCURRENCY", "2"))  # Max simultaneous Stooq requests
+STOOQ_TIMEOUT = 8.0  # Timeout for Stooq requests in seconds
+
+# Worker configuration
+VERIFY_MAX_WORKERS = min(4, (os.cpu_count() or 4))  # Max concurrent verification workers
+
+# Output configuration
+VERIFY_OUTPUT_DIR = DATA_DIR / "trade-log"  # Directory for verification output
+
+# Note: Verification uses REVISED_CONFIDENCE_THRESHOLD (70) from TRADING SIGNAL THRESHOLDS section above
+
+# =====================================================================
 # COMMAND LINE ARGUMENT PARSER
 # =====================================================================
 

@@ -179,8 +179,9 @@ Dashboard features:
 - Special alerts for refined signals
 - Graceful shutdown on Ctrl+C
 
-## Testing
+## Testing & Verification
 
+### Run Tests
 ```bash
 # Run all tests
 for test in test/test_*.py; do python "$test"; done
@@ -194,6 +195,28 @@ python test/test_listing_logic.py    # Test stock listings
 # Test dashboard visualization
 python test_dashboard.py              # Run dashboard with simulated data
 ```
+
+### Verify Trading Signals
+```bash
+# Verify refined signals (revised_confidence >= 70%)
+python verify.py
+
+# With custom threshold (both work the same)
+python verify.py --threshold 60
+python verify.py --revised-confidence 60
+
+# Faster verification with more workers
+python verify.py --max-workers 8
+```
+
+The verification system:
+- **Automatically scans** all `signals_*.jsonl` files in `data/trade-log/`
+- **Only verifies refined signals** with `revised_confidence >= REVISED_CONFIDENCE_THRESHOLD (70%)`
+- Uses **Stooq** for free market data (no API keys required)
+- Calculates PnL, Maximum Favorable/Adverse Excursions
+- Evaluates expected price accuracy
+- Outputs organized reports with emojis for clarity
+- Saves results to `data/trade-log/verification_YYYYMMDD_HHMMSS.json`
 
 ## Key Processing Logic
 
@@ -227,6 +250,32 @@ python test_dashboard.py              # Run dashboard with simulated data
 - LM Studio with loaded model
 - 4GB+ RAM recommended
 - Stable internet connection
+
+## Signal Verification
+
+Hermes includes a verification system to track signal performance:
+
+```bash
+# Basic verification (uses REVISED_CONFIDENCE_THRESHOLD from args.py)
+python verify.py
+
+# Override threshold (consistent with main.py)
+python verify.py --revised-confidence 60
+
+# Custom configuration via environment
+export STOOQ_MAX_CONCURRENCY=2  # Limit concurrent Stooq requests
+python verify.py --max-workers 2
+```
+
+Verification features:
+- **Auto-discovery**: Finds all `signals_*.jsonl` files in trade-log directory
+- **Refined Signals Only**: Verifies signals with `revised_confidence >= 70%` (configurable)
+- **Consistent Parameters**: Supports `--revised-confidence` like main.py for consistency
+- **Stooq-only**: Uses free Stooq data, no API keys needed
+- **Readable Output**: Color-coded emojis show wins/losses at a glance
+- **Accuracy Tracking**: Evaluates expected_price predictions
+- **MFE/MAE Analysis**: Maximum favorable and adverse price excursions
+- **Centralized Config**: Uses `REVISED_CONFIDENCE_THRESHOLD` from `args.py`
 
 ## Troubleshooting
 
