@@ -47,25 +47,43 @@ DASHBOARD = None
 
 
 # Helper to compute dashboard recent limit
-def _calc_recent_limit() -> int:
+def _calc_recent_limit(args=None) -> int:
     """
     Compute how many rows the 'Recent Decisions' panel should try to show.
     Priority:
-      1) Env override: DASHBOARD_RECENT_LIMIT
-      2) Terminal height derived: rows - 8 (header/footer), clamped to [20, 200]
-      3) Fallback: 30
+      1) Command-line argument: --dashboard-recent-limit
+      2) Env override: DASHBOARD_RECENT_LIMIT
+      3) Terminal height derived: rows - 15 (for header/footer/other panels)
+      4) Fallback: DASHBOARD_DEFAULT_RECENT_DECISIONS from args.py
     """
+    from args import (
+        DASHBOARD_MIN_RECENT_DECISIONS, 
+        DASHBOARD_MAX_RECENT_DECISIONS, 
+        DASHBOARD_DEFAULT_RECENT_DECISIONS
+    )
+    
+    # Check command-line argument first
+    if args and hasattr(args, 'dashboard_recent_limit') and args.dashboard_recent_limit:
+        return max(DASHBOARD_MIN_RECENT_DECISIONS, min(DASHBOARD_MAX_RECENT_DECISIONS, args.dashboard_recent_limit))
+    
+    # Check environment variable override
     env = os.environ.get("DASHBOARD_RECENT_LIMIT")
     if env:
         try:
-            return max(10, int(env))
+            return max(DASHBOARD_MIN_RECENT_DECISIONS, min(DASHBOARD_MAX_RECENT_DECISIONS, int(env)))
         except Exception:
             pass
+    
+    # Calculate based on terminal size
     try:
         size = shutil.get_terminal_size(fallback=(120, 40))
-        return max(20, min(200, size.lines - 8))
+        # Reserve space for header(3) + queue/stats + alerts(5) + console(8) = ~15 lines
+        available = size.lines - 15
+        # Allocate about 60% of available space to decisions panel
+        decision_lines = int(available * 0.6)
+        return max(DASHBOARD_MIN_RECENT_DECISIONS, min(DASHBOARD_MAX_RECENT_DECISIONS, decision_lines))
     except Exception:
-        return 30
+        return DASHBOARD_DEFAULT_RECENT_DECISIONS
 
 
 def handle_signal(signum, frame):
@@ -623,7 +641,7 @@ def main():
     # Initialize dashboard if not in quiet mode
     if not args.quiet and sys.stdout.isatty():
         logging.info("Initializing status dashboard...")
-        recent_limit = _calc_recent_limit()
+        recent_limit = _calc_recent_limit(args)
         # Try multiple constructor signatures (recent_limit vs max_recent)
         try:
             DASHBOARD = StatusDashboard(queue=NEWS_QUEUE, recent_limit=recent_limit)

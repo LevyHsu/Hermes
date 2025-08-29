@@ -122,6 +122,17 @@ SEC_USER_AGENT = os.getenv(
 )
 
 # =====================================================================
+# DASHBOARD CONFIGURATION
+# =====================================================================
+
+# Dashboard display settings
+DASHBOARD_MIN_RECENT_DECISIONS = 10  # Minimum decisions to show
+DASHBOARD_MAX_RECENT_DECISIONS = 200  # Maximum decisions to show
+DASHBOARD_DEFAULT_RECENT_DECISIONS = 30  # Default if terminal size unknown
+DASHBOARD_CONSOLE_LOG_LINES = 15  # Number of console log lines to keep
+DASHBOARD_COMPACT_MODE_THRESHOLD = 20  # Use compact display above this many decisions
+
+# =====================================================================
 # VERIFICATION CONFIGURATION (verify.py)
 # =====================================================================
 
@@ -321,6 +332,21 @@ Configuration Priority:
         type=int,
         default=REVISED_CONFIDENCE_THRESHOLD,
         help=f'Revised confidence threshold for logging (default: {REVISED_CONFIDENCE_THRESHOLD})'
+    )
+    
+    # Dashboard options
+    dashboard = parser.add_argument_group('Dashboard Options')
+    dashboard.add_argument(
+        '--dashboard-recent-limit',
+        type=int,
+        default=None,
+        help=f'Number of recent decisions to display (default: auto based on terminal size, min: {DASHBOARD_MIN_RECENT_DECISIONS}, max: {DASHBOARD_MAX_RECENT_DECISIONS})'
+    )
+    dashboard.add_argument(
+        '--dashboard-compact',
+        type=int,
+        default=DASHBOARD_COMPACT_MODE_THRESHOLD,
+        help=f'Threshold for compact display mode (default: {DASHBOARD_COMPACT_MODE_THRESHOLD})'
     )
     
     # Processing options

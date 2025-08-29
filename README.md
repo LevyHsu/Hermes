@@ -119,6 +119,8 @@ Options:
   --confidence-threshold N     Min confidence for enrichment (default: 70)
   --news-threads N             Concurrent feed threads (default: 16)
   --smart-scheduling           Enable adaptive time allocation
+  --dashboard-recent-limit N   Number of decisions to display (auto by default)
+  --dashboard-compact N        Threshold for compact mode (default: 20)
 ```
 
 ## Data Structure
@@ -174,10 +176,23 @@ The system includes a rich terminal dashboard showing:
 - **Console Output**: Real-time system messages with color coding
 
 Dashboard features:
+- **Dynamic capacity**: Automatically adjusts to terminal size (10-200 decisions)
+- **Compact mode**: Switches to space-efficient display above 20 decisions
+- **Flexible layout**: Adjusts panel sizes based on content
 - Updates every 2 seconds
 - Color-coded confidence levels (green ≥80%, yellow ≥60%)
 - Special alerts for refined signals
 - Graceful shutdown on Ctrl+C
+
+Configure dashboard:
+```bash
+# Set specific number of decisions to show
+python main.py --dashboard-recent-limit 50
+
+# Or use environment variable
+export DASHBOARD_RECENT_LIMIT=100
+python main.py
+```
 
 ## Testing & Verification
 
