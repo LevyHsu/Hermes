@@ -374,20 +374,47 @@ def verify_signal(signal: Signal, fetcher: StooqFetcher) -> Verification:
     # Fetch current price
     current_price, as_of_date = fetcher.fetch_current(signal.ticker)
     
-    # Fetch historical bars
-    bars = fetcher.fetch_daily_bars(signal.ticker, days_back=30)
+    # Fetch historical bars (get more days to ensure we have data before and after signal)
+    bars = fetcher.fetch_daily_bars(signal.ticker, days_back=60)
     
     entry_price = None
     mfe = None
     mae = None
     
     if bars and bars["closes"]:
-        # Use last close as entry (simplified - could match by date)
-        entry_price = bars["closes"][-1] if not math.isnan(bars["closes"][-1]) else None
+        # Find the signal date in the bars
+        signal_date = signal.timestamp.strftime("%Y-%m-%d")
         
-        # Calculate MFE/MAE
-        if entry_price:
-            mfe, mae = calculate_mfe_mae(signal.action, entry_price, bars["highs"], bars["lows"])
+        # Find the index of the signal date or the next trading day
+        entry_idx = None
+        for i, date in enumerate(bars["dates"]):
+            if date >= signal_date:
+                entry_idx = i
+                break
+        
+        # If signal is today or very recent, use current price as entry
+        if entry_idx is None or entry_idx >= len(bars["dates"]) - 1:
+            # Signal is after all historical data, use current price
+            entry_price = current_price
+            # No historical data after signal for MFE/MAE
+            mfe = None
+            mae = None
+        else:
+            # Use the close price on signal date (or next trading day) as entry
+            entry_price = bars["closes"][entry_idx] if not math.isnan(bars["closes"][entry_idx]) else None
+            
+            # Calculate MFE/MAE only from bars AFTER the signal
+            if entry_price and entry_idx < len(bars["highs"]) - 1:
+                # Get bars after entry (entry_idx + 1 onwards)
+                highs_after = bars["highs"][entry_idx + 1:]
+                lows_after = bars["lows"][entry_idx + 1:]
+                
+                # Include current price in the calculation
+                if current_price:
+                    highs_after = list(highs_after) + [current_price]
+                    lows_after = list(lows_after) + [current_price]
+                
+                mfe, mae = calculate_mfe_mae(signal.action, entry_price, highs_after, lows_after)
     
     # Calculate PnL
     pnl_dollars = None
@@ -481,8 +508,18 @@ def print_summary(verifications: List[Verification]):
                 print(f"  {emoji} PnL: {sign}${v.pnl_dollars:.2f} ({sign}{v.pnl_percent:.2f}%)")
             
             # MFE/MAE
-            if v.max_favorable is not None:
-                print(f"  📊 Max Favorable: ${v.max_favorable:.2f} | Max Adverse: ${v.max_adverse:.2f}")
+            if v.max_favorable is not None and v.max_adverse is not None:
+                # Show with better clarity about what these mean
+                if v.action == "BUY":
+                    mfe_label = f"Best: +${v.max_favorable:.2f}" if v.max_favorable > 0 else "Best: $0.00"
+                    mae_label = f"Worst: -${v.max_adverse:.2f}" if v.max_adverse > 0 else "Worst: $0.00"
+                else:  # SELL
+                    mfe_label = f"Best: +${v.max_favorable:.2f}" if v.max_favorable > 0 else "Best: $0.00"
+                    mae_label = f"Worst: -${v.max_adverse:.2f}" if v.max_adverse > 0 else "Worst: $0.00"
+                print(f"  📊 Since Entry: {mfe_label} | {mae_label}")
+            elif v.entry_price and v.current_price:
+                # Signal is too recent, no historical movement yet
+                print(f"  📊 Signal too recent - no price history yet")
             
             # Expected price accuracy
             if v.expected_price and v.expected_accuracy != "N/A":
