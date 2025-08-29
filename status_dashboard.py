@@ -128,7 +128,6 @@ class StatusDashboard:
             table.add_column("Time", style="dim", width=5)
             table.add_column("Tkr", style="cyan", width=5)
             table.add_column("Act", width=3)
-            table.add_column("Price", style="white", width=7)
             table.add_column("C%", width=3)
             table.add_column("R%", width=3)
             table.add_column("Tgt", width=6)
@@ -138,7 +137,6 @@ class StatusDashboard:
             table.add_column("Time", style="dim", width=8)
             table.add_column("Ticker", style="cyan", width=6)
             table.add_column("Action", width=6)
-            table.add_column("Price", style="white", width=8)
             table.add_column("Conf", width=4)
             table.add_column("Rev", width=4)
             table.add_column("Target", width=8)
@@ -151,9 +149,6 @@ class StatusDashboard:
             revised = decision.get('revised_confidence', 0)
             target = decision.get('expected_price', '')
             
-            # Get current/entry price from decision
-            current_price = decision.get('current_price') or decision.get('price') or decision.get('entry_price')
-            
             # Format based on display mode
             if use_compact:
                 # Compact formatting
@@ -162,15 +157,6 @@ class StatusDashboard:
                 action_short = "B" if action == "BUY" else "S" if action == "SELL" else "-"
                 action_color = "green" if action == "BUY" else "red"
                 action_text = f"[{action_color}]{action_short}[/{action_color}]"
-                
-                # Format current price (compact)
-                if current_price:
-                    if current_price >= 1000:
-                        price_text = f"{current_price/1000:.1f}K"
-                    else:
-                        price_text = f"{current_price:.1f}"
-                else:
-                    price_text = "-"
                 
                 # Simplified confidence display (no % sign to save space)
                 conf_color = "bold green" if confidence >= high_threshold else "yellow" if confidence >= 60 else "white"
@@ -194,9 +180,6 @@ class StatusDashboard:
                 action_color = "green" if action == "BUY" else "red"
                 action_text = f"[{action_color}]{action}[/{action_color}]"
                 
-                # Format current price (normal)
-                price_text = f"${current_price:.2f}" if current_price else "-"
-                
                 conf_color = "bold green" if confidence >= high_threshold else "yellow" if confidence >= 60 else "white"
                 conf_text = f"[{conf_color}]{confidence}%[/{conf_color}]"
                 
@@ -207,7 +190,7 @@ class StatusDashboard:
                 
                 target_text = f"${target:.2f}" if target else "-"
             
-            table.add_row(time_str, ticker, action_text, price_text, conf_text, rev_text, target_text)
+            table.add_row(time_str, ticker, action_text, conf_text, rev_text, target_text)
         
         # Add summary info to title
         title = f"📈 Recent Decisions ({num_decisions}/{self.recent_limit})"
@@ -498,7 +481,6 @@ if __name__ == "__main__":
                     'action': random.choice(['BUY', 'SELL']),
                     'confidence': random.randint(50, 95),
                     'revised_confidence': random.randint(70, 95) if random.random() > 0.5 else 0,
-                    'current_price': random.uniform(50, 500),  # Add current price
                     'expected_price': random.uniform(100, 500) if random.random() > 0.5 else None
                 })
             

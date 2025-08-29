@@ -716,13 +716,6 @@ def refine_decision(client: LMStudioClient, news_item: Dict[str, Any], decision:
         # Handle timeframe
         refined["horizon_hours"] = result.get("horizon_hours", 24)
         
-        # Add current price from price data if available
-        if price_data and "stats" in price_data:
-            current_price = price_data["stats"].get("current")
-            if current_price:
-                refined["current_price"] = current_price
-                refined["entry_price"] = current_price  # Also store as entry price for the signal
-        
         # Handle reasoning - ensure we get valid text
         raw_reasoning = result.get("reasoning", "")
         if raw_reasoning and isinstance(raw_reasoning, str) and len(raw_reasoning) > 10:

@@ -49,7 +49,6 @@ def main():
                     'action': random.choice(['BUY', 'SELL']),
                     'confidence': confidence,
                     'revised_confidence': revised,
-                    'current_price': random.uniform(50, 300),  # Add current price
                     'expected_price': random.uniform(100, 500) if revised > 0 else None,
                     'reason': f"Test reason for {ticker}"
                 })
