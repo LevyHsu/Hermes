@@ -60,6 +60,10 @@ from pathlib import Path
 import sqlite3
 from readability import Document  # pip install readability-lxml
 from bs4 import BeautifulSoup     # pip install beautifulsoup4
+import logging
+
+# Suppress readability errors
+logging.getLogger('readability.readability').setLevel(logging.CRITICAL)
 
 # ---------- Reliable default feeds (official) ----------
 # (Verified official pages below in citations)
@@ -332,7 +336,8 @@ def readability_extract(url: str, timeout: float = 10.0) -> Optional[str]:
         content_html = doc.summary(html_partial=True)
         text = html_to_text(content_html)
         return text or None
-    except Exception:
+    except (ValueError, Exception):
+        # Silently handle XML/control character errors and other exceptions
         return None
 
 def enrich_records_with_article_body(records: List[Dict[str, Any]], deadline: datetime, threads: int, request_timeout: float, verbose: bool) -> List[Dict[str, Any]]:

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 # Local imports
-from args import get_args
+from args import get_args, DATA_DIR, NEWS_DIR, RESULT_DIR, LISTING_DIR, TRADE_LOG_DIR, LOGS_DIR
 from status_dashboard import StatusDashboard
 from fetch_us_listings import run as update_stock_listings
 from llm import LMStudioClient
@@ -27,14 +27,8 @@ from news_harvester import harvest_single_cycle
 from news_feed import DEFAULT_FEEDS, load_extra_feeds
 from priority_queue_processor import TimeOrderedNewsQueue, NewsItem
 
-# Directories
-DATA_DIR = Path("data")
-NEWS_DIR = DATA_DIR / "news"
+# Additional directory not in args.py
 LLM_DIR = DATA_DIR / "llm"
-RESULT_DIR = DATA_DIR / "result"
-TRADE_LOG_DIR = DATA_DIR / "trade-log"
-LISTING_DIR = DATA_DIR / "us-stock-listing"
-LOGS_DIR = Path("logs")
 
 
 # Global resources

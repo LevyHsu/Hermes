@@ -23,12 +23,15 @@ from pathlib import Path
 
 import requests
 
+# Import centralized configuration
+from args import LISTING_DIR as DATA_DIR, SEC_USER_AGENT
+
+# Ensure directory exists
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # --------------------
 # Config
 # --------------------
-DATA_DIR = Path("data/us-stock-listing")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -40,12 +43,6 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 ET_TZ = ZoneInfo("America/New_York")
-
-# SEC requires a descriptive User-Agent. Set your email here or via env.
-SEC_USER_AGENT = os.environ.get(
-    "SEC_USER_AGENT",
-    "AutoTraderPrototype/0.1 (contact: you@example.com)"
-)
 
 HTTP_TIMEOUT = 30  # seconds
 
