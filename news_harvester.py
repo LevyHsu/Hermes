@@ -28,6 +28,10 @@ import feedparser
 import requests
 from readability import Document
 from bs4 import BeautifulSoup
+import logging
+
+# Suppress readability errors
+logging.getLogger('readability.readability').setLevel(logging.CRITICAL)
 
 # Import feed list from news_feed
 from news_feed import (

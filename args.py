@@ -27,10 +27,11 @@ DATA_DIR = Path("./data")
 NEWS_DIR = DATA_DIR / "news"
 RESULT_DIR = DATA_DIR / "result"
 LISTING_DIR = DATA_DIR / "us-stock-listing"
+TRADE_LOG_DIR = DATA_DIR / "trade-log"
 LOGS_DIR = Path("./logs")
 
 # Ensure directories exist
-for dir_path in [DATA_DIR, NEWS_DIR, RESULT_DIR, LISTING_DIR, LOGS_DIR]:
+for dir_path in [DATA_DIR, NEWS_DIR, RESULT_DIR, LISTING_DIR, TRADE_LOG_DIR, LOGS_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
 # =====================================================================
@@ -147,7 +148,7 @@ STOOQ_TIMEOUT = 8.0  # Timeout for Stooq requests in seconds
 VERIFY_MAX_WORKERS = min(4, (os.cpu_count() or 4))  # Max concurrent verification workers
 
 # Output configuration
-VERIFY_OUTPUT_DIR = DATA_DIR / "trade-log"  # Directory for verification output
+VERIFY_OUTPUT_DIR = TRADE_LOG_DIR  # Directory for verification output (same as trade logs)
 
 # Note: Verification uses REVISED_CONFIDENCE_THRESHOLD (70) from TRADING SIGNAL THRESHOLDS section above
 
