@@ -263,8 +263,20 @@ The verification system:
 
 - Python 3.9+ (uses zoneinfo)
 - LM Studio with loaded model
-- 4GB+ RAM recommended
+- 96GB+ VRAM recommended for large models
+- 16GB+ RAM recommended
 - Stable internet connection
+
+### Tested Platform
+- **Hardware**: MacBook Pro 16-inch
+  - M4 Max chip with 16-core CPU
+  - 40-core GPU
+  - 128GB unified memory
+  - 2TB SSD storage
+  - 1Gbps network connection
+- **Models Tested**:
+  - Llama 3.3-70B
+  - GPT-OSS-120B
 
 ## Signal Verification
 
