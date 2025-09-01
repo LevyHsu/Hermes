@@ -603,7 +603,7 @@ def analyze_news_initial(client: LMStudioClient, news_item: Dict[str, Any], list
                 "ticker": ticker,
                 "action": decision.get("action", "BUY"),
                 "confidence": confidence,
-                "reason": truncate_with_ellipsis(reason, 200),
+                "reason": reason,  # Full reasoning without truncation
                 "company_name": listings[ticker].name,
             })
         elif client.verbose:
@@ -746,7 +746,7 @@ def refine_decision(client: LMStudioClient, news_item: Dict[str, Any], decision:
             cleaned_reason = clean_text(raw_reasoning)
             # Check if reason is just dots/ellipsis or garbage
             if cleaned_reason and not all(c in "... " for c in cleaned_reason):
-                refined["refined_reason"] = truncate_with_ellipsis(cleaned_reason, 200)
+                refined["refined_reason"] = cleaned_reason  # Full reasoning without truncation
             else:
                 refined["refined_reason"] = "Model refinement analysis based on recent news and price action"
         else:
