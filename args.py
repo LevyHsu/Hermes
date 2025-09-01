@@ -81,8 +81,8 @@ LLM_VERBOSE = True  # Enable detailed logging for LLM
 # =====================================================================
 
 # Confidence thresholds for logging trades
-HIGH_CONFIDENCE_THRESHOLD = 80  # Log trades with confidence >= this value
-REVISED_CONFIDENCE_THRESHOLD = 70  # Log trades with revised confidence >= this value
+HIGH_CONFIDENCE_THRESHOLD = 90  # Log trades with confidence >= this value
+REVISED_CONFIDENCE_THRESHOLD = 80  # Log trades with revised confidence >= this value
 
 # =====================================================================
 # LOGGING CONFIGURATION
