@@ -583,7 +583,7 @@ Examples:
         "--threshold",
         type=float,
         default=REVISED_CONFIDENCE_THRESHOLD,
-        help=f"Minimum revised_confidence for signals (default: {REVISED_CONFIDENCE_THRESHOLD}%)"
+        help=f"Minimum revised_confidence for signals (default: {REVISED_CONFIDENCE_THRESHOLD}%%)"
     )
     parser.add_argument(
         "--revised-confidence",
