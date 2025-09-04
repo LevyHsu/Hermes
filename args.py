@@ -141,11 +141,11 @@ DASHBOARD_COMPACT_MODE_THRESHOLD = 20  # Use compact display above this many dec
 VERIFY_TIMEZONE = "Australia/Adelaide"
 
 # Stooq data fetching configuration
-STOOQ_MAX_CONCURRENCY = int(os.getenv("STOOQ_MAX_CONCURRENCY", "2"))  # Max simultaneous Stooq requests
+STOOQ_MAX_CONCURRENCY = int(os.getenv("STOOQ_MAX_CONCURRENCY", "6"))  # Max simultaneous Stooq requests
 STOOQ_TIMEOUT = 8.0  # Timeout for Stooq requests in seconds
 
 # Worker configuration
-VERIFY_MAX_WORKERS = min(4, (os.cpu_count() or 4))  # Max concurrent verification workers
+VERIFY_MAX_WORKERS = 6  # Max concurrent verification workers (default)
 
 # Output configuration
 VERIFY_OUTPUT_DIR = TRADE_LOG_DIR  # Directory for verification output (same as trade logs)

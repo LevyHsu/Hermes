@@ -93,8 +93,10 @@ class StooqFetcher:
     CURRENT_URL = "https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
     DAILY_URL = "https://stooq.com/q/d/l/?s={sym}&i=d"
     
-    def __init__(self):
-        self.semaphore = threading.Semaphore(STOOQ_MAX_CONCURRENCY)
+    def __init__(self, max_concurrency=None):
+        # Use provided max_concurrency or default from config
+        concurrency = max_concurrency if max_concurrency else STOOQ_MAX_CONCURRENCY
+        self.semaphore = threading.Semaphore(concurrency)
     
     def _http_get(self, url: str) -> bytes:
         """HTTP GET with rate limiting and retries"""
@@ -384,6 +386,10 @@ def verify_signal(signal: Signal, fetcher: StooqFetcher) -> Verification:
     if bars and bars["closes"]:
         # Find the signal date in the bars
         signal_date = signal.timestamp.strftime("%Y-%m-%d")
+        today = dt.datetime.now(ZoneInfo(VERIFY_TIMEZONE) if ZoneInfo else None).strftime("%Y-%m-%d")
+        
+        # Check if signal is from today
+        is_today_signal = (signal_date == today)
         
         # Find the index of the signal date or the next trading day
         entry_idx = None
@@ -392,13 +398,47 @@ def verify_signal(signal: Signal, fetcher: StooqFetcher) -> Verification:
                 entry_idx = i
                 break
         
-        # If signal is today or very recent, use current price as entry
-        if entry_idx is None or entry_idx >= len(bars["dates"]) - 1:
-            # Signal is after all historical data, use current price
-            entry_price = current_price
-            # No historical data after signal for MFE/MAE
-            mfe = None
-            mae = None
+        # If signal is today or very recent
+        if is_today_signal:
+            # For today's signals, try to use yesterday's close as entry price
+            if bars["dates"] and len(bars["closes"]) > 0:
+                # Use the most recent close (yesterday's close) as entry
+                entry_price = bars["closes"][-1] if not math.isnan(bars["closes"][-1]) else current_price
+            else:
+                entry_price = current_price
+            
+            # Calculate preliminary MFE/MAE for today's signals
+            if entry_price and current_price:
+                if signal.action == "BUY":
+                    mfe = max(0, current_price - entry_price)
+                    mae = max(0, entry_price - current_price)
+                else:  # SELL
+                    mfe = max(0, entry_price - current_price)
+                    mae = max(0, current_price - entry_price)
+            else:
+                mfe = None
+                mae = None
+        elif entry_idx is None or entry_idx >= len(bars["dates"]) - 1:
+            # Try to use the last available close price as entry, or current if signal is after all data
+            if entry_idx is not None and entry_idx < len(bars["closes"]):
+                # Use the close price on the signal date (last available bar)
+                entry_price = bars["closes"][entry_idx] if not math.isnan(bars["closes"][entry_idx]) else current_price
+            else:
+                # Signal is after all historical data, use current price
+                entry_price = current_price
+            
+            # Use current price for preliminary MFE/MAE calculation
+            if entry_price and current_price:
+                # For recent signals, calculate MFE/MAE using just current price
+                if signal.action == "BUY":
+                    mfe = max(0, current_price - entry_price)
+                    mae = max(0, entry_price - current_price)
+                else:  # SELL
+                    mfe = max(0, entry_price - current_price)
+                    mae = max(0, current_price - entry_price)
+            else:
+                mfe = None
+                mae = None
         else:
             # Use the close price on signal date (or next trading day) as entry
             entry_price = bars["closes"][entry_idx] if not math.isnan(bars["closes"][entry_idx]) else None
@@ -472,12 +512,26 @@ def print_summary(verifications: List[Verification]):
     with_pnl = sum(1 for v in verifications if v.pnl_percent is not None)
     profitable = sum(1 for v in verifications if v.pnl_percent and v.pnl_percent > 0)
     
+    # Calculate total PnL in USD
+    total_gains = sum(v.pnl_dollars for v in verifications if v.pnl_dollars and v.pnl_dollars > 0)
+    total_losses = sum(abs(v.pnl_dollars) for v in verifications if v.pnl_dollars and v.pnl_dollars < 0)
+    net_pnl = sum(v.pnl_dollars for v in verifications if v.pnl_dollars)
+    
     print(f"\n📈 Summary Statistics:")
     print(f"  • Total Refined Signals: {total}")
     print(f"  • Signals with PnL: {with_pnl}")
     if with_pnl > 0:
         win_rate = (profitable / with_pnl) * 100
         print(f"  • Win Rate: {win_rate:.1f}% ({profitable}/{with_pnl})")
+    
+    # PnL Summary in USD
+    print(f"\n💰 P&L Summary (per share basis):")
+    print(f"  • Total Gains: ${total_gains:,.2f}")
+    print(f"  • Total Losses: ${total_losses:,.2f}")
+    if net_pnl >= 0:
+        print(f"  • Net P&L: ${net_pnl:,.2f} ✅")
+    else:
+        print(f"  • Net P&L: -${abs(net_pnl):,.2f} ❌")
     
     # Detailed results by ticker
     for ticker in sorted(by_ticker.keys()):
@@ -518,15 +572,34 @@ def print_summary(verifications: List[Verification]):
                     mae_label = f"Worst: -${v.max_adverse:.2f}" if v.max_adverse > 0 else "Worst: $0.00"
                 print(f"  📊 Since Entry: {mfe_label} | {mae_label}")
             elif v.entry_price and v.current_price:
-                # Signal is too recent, no historical movement yet
-                print(f"  📊 Signal too recent - no price history yet")
+                # Signal is recent, showing current movement only
+                if v.max_favorable is not None and v.max_adverse is not None:
+                    # We have current price movement
+                    if signal.action == "BUY":
+                        mfe_label = f"Since Open: +${v.max_favorable:.2f}" if v.max_favorable > 0 else "Since Open: $0.00"
+                        mae_label = f"Down: -${v.max_adverse:.2f}" if v.max_adverse > 0 else "Flat"
+                    else:  # SELL
+                        mfe_label = f"Since Open: +${v.max_favorable:.2f}" if v.max_favorable > 0 else "Since Open: $0.00"
+                        mae_label = f"Up: -${v.max_adverse:.2f}" if v.max_adverse > 0 else "Flat"
+                    print(f"  📊 Today's signal: {mfe_label} | {mae_label}")
+                else:
+                    print(f"  📊 Recent signal - limited price data")
             
             # Expected price accuracy
             if v.expected_price and v.expected_accuracy != "N/A":
                 print(f"  🎯 Expected: ${v.expected_price:.2f} → {v.expected_accuracy}")
     
     print(f"\n{'=' * 80}")
-    print(f"Data source: {verifications[0].data_source if verifications else 'Stooq'}")
+    
+    # Check if markets might be closed (all signals have 0 PnL)
+    all_zero_pnl = all(
+        v.pnl_dollars == 0 or v.pnl_dollars is None 
+        for v in verifications
+    )
+    if all_zero_pnl and verifications:
+        print("⚠️  Note: All positions show $0 PnL - markets may be closed (holiday/weekend)")
+    
+    print(f"Data source: Stooq")
     print(f"Report generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80)
 
@@ -625,8 +698,8 @@ Examples:
     print(f"📊 Found {len(signals)} refined signals across {len(by_ticker)} tickers")
     print(f"🔄 Verifying refined signals with {args.max_workers} workers...")
     
-    # Initialize fetcher
-    fetcher = StooqFetcher()
+    # Initialize fetcher with same concurrency as max_workers
+    fetcher = StooqFetcher(max_concurrency=args.max_workers)
     
     # Process signals
     verifications = []
