@@ -201,9 +201,11 @@ def harvester_thread(args):
                             if DASHBOARD:
                                 DASHBOARD.add_console_log(msg, "success")
                             
-                            # Update dashboard
+                            # Update dashboard with queue stats and total news count
                             if DASHBOARD:
-                                DASHBOARD.update_queue_stats(NEWS_QUEUE.get_stats())
+                                stats = NEWS_QUEUE.get_stats()
+                                stats['total_news'] = DASHBOARD.stats.get('total_news', 0) + len(items)
+                                DASHBOARD.update_queue_stats(stats)
                         
                 except Exception as e:
                     msg = f"Error processing harvested news: {e}"
