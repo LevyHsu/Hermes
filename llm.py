@@ -462,7 +462,7 @@ ACTION & CONFIDENCE
   • 50–69: Mixed/indirect read‑through; prefer to OMIT rather than include.
   • <50: Exclude.
 
-REASON (≤ 180 words)
+REASON
 - Cite one or two concrete facts from the article + the mechanism (why it matters) + the trading implication.
 - Avoid boilerplate and generic hype. No target prices here (targets are set in the refinement phase).
 """
@@ -481,7 +481,7 @@ def build_initial_schema() -> Dict[str, Any]:
                         "ticker": {"type": "string", "pattern": r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$"},
                         "action": {"type": "string", "enum": ["BUY", "SELL"]},
                         "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "reason": {"type": "string", "minLength": 3, "maxLength": 600}
+                        "reason": {"type": "string", "minLength": 3, "maxLength": 2000}
                     },
                     "required": ["ticker", "action", "confidence", "reason"],
                     "additionalProperties": False
@@ -648,7 +648,7 @@ CONFIDENCE (0–100)
 - 70–89: Strong but not iron‑clad; some risk or late entry.
 - 50–69: Weak/mixed; use only if there is still a defined edge.
 
-REASONING (≤ 200 words)
+REASONING
 - One paragraph referencing: (a) the specific news driver, (b) what price is doing, (c) why the target/horizon is reasonable, (d) why confidence changed.
 - No disclaimers or filler.
 """
@@ -664,7 +664,7 @@ def build_refine_schema() -> Dict[str, Any]:
             "revised_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
             "expected_high_price": {"type": "number", "minimum": 0},
             "horizon_hours": {"type": "integer", "minimum": 1, "maximum": 168},  # Up to 1 week
-            "reasoning": {"type": "string", "minLength": 10, "maxLength": 600}
+            "reasoning": {"type": "string", "minLength": 10, "maxLength": 2000}
         },
         "required": ["ticker", "action", "original_confidence", "revised_confidence", 
                    "expected_high_price", "horizon_hours", "reasoning"],
