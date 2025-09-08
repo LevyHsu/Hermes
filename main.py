@@ -498,7 +498,7 @@ def log_human_readable_decisions(results: List[Dict], minute_key: str, news_item
                     
                     # Refined reasoning
                     if decision.get('refined_reason'):
-                        f.write(f"   Reasoning: {decision['refined_reason'][:200]}\n")
+                        f.write(f"   Reasoning: {decision['refined_reason']}\n")
                     
                     f.write("\n")
                 
@@ -525,7 +525,7 @@ def log_trading_signals(results: List[Dict], minute_key: str, args):
                         'ticker': decision['ticker'],
                         'action': decision['action'],
                         'confidence': decision['confidence'],
-                        'reason': decision.get('reason', '')[:200]  # Truncate reason
+                        'reason': decision.get('reason', '')  # Full reason, no truncation
                     }
                     
                     # Add enriched fields if present (from 2nd stage LLM)
@@ -546,7 +546,7 @@ def log_trading_signals(results: List[Dict], minute_key: str, args):
                         signal['entry_price'] = decision['entry_price']
                         
                     if decision.get('refined_reason'):
-                        signal['refined_reason'] = decision.get('refined_reason', '')[:500]
+                        signal['refined_reason'] = decision.get('refined_reason', '')  # Full refined reason, no truncation
                         
                     f.write(json.dumps(signal) + '\n')
                     
