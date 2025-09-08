@@ -63,7 +63,8 @@ class StatusDashboard:
             'total_decisions': 0,
             'queue_size': 0,
             'items_added': 0,
-            'items_dropped': 0
+            'items_dropped': 0,
+            'total_news': 0  # New counter for total news processed
         }
         self.running = False
         self.thread = None
@@ -218,6 +219,9 @@ class StatusDashboard:
         
         # Decision statistics
         stats_text.append("Trading Statistics\n", style="bold cyan")
+        stats_text.append(f"Total News Processed: ", style="white")
+        stats_text.append(f"{self.stats['total_news']}\n", style="bold white")
+        
         stats_text.append(f"Total Decisions: ", style="white")
         stats_text.append(f"{self.stats['total_decisions']}\n", style="bold white")
         
@@ -408,7 +412,13 @@ class StatusDashboard:
     
     def update_queue_stats(self, stats: Dict[str, Any]):
         """Update queue statistics."""
-        self.stats.update(stats)
+        # Preserve and accumulate total_news counter
+        if 'total_news' in stats:
+            self.stats['total_news'] = stats['total_news']
+        # Update other stats
+        for key, value in stats.items():
+            if key != 'total_news':  # Don't overwrite total_news again
+                self.stats[key] = value
     
     def set_processing(self, minute_key: Optional[str]):
         """Set current processing item."""
