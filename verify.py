@@ -517,6 +517,14 @@ def print_summary(verifications: List[Verification]):
     total_losses = sum(abs(v.pnl_dollars) for v in verifications if v.pnl_dollars and v.pnl_dollars < 0)
     net_pnl = sum(v.pnl_dollars for v in verifications if v.pnl_dollars)
     
+    # Find max individual gain and loss
+    max_gain = max((v.pnl_dollars for v in verifications if v.pnl_dollars and v.pnl_dollars > 0), default=0)
+    max_loss = max((abs(v.pnl_dollars) for v in verifications if v.pnl_dollars and v.pnl_dollars < 0), default=0)
+    
+    # Find tickers for max gain/loss
+    max_gain_ticker = next((v.ticker for v in verifications if v.pnl_dollars and v.pnl_dollars == max_gain), None)
+    max_loss_ticker = next((v.ticker for v in verifications if v.pnl_dollars and v.pnl_dollars == -max_loss), None)
+    
     print(f"\n📈 Summary Statistics:")
     print(f"  • Total Refined Signals: {total}")
     print(f"  • Signals with PnL: {with_pnl}")
@@ -532,6 +540,12 @@ def print_summary(verifications: List[Verification]):
         print(f"  • Net P&L: ${net_pnl:,.2f} ✅")
     else:
         print(f"  • Net P&L: -${abs(net_pnl):,.2f} ❌")
+    
+    # Max gain/loss details
+    if max_gain > 0:
+        print(f"  • Max Gain: ${max_gain:,.2f} ({max_gain_ticker})")
+    if max_loss > 0:
+        print(f"  • Max Loss: ${max_loss:,.2f} ({max_loss_ticker})")
     
     # Detailed results by ticker
     for ticker in sorted(by_ticker.keys()):
