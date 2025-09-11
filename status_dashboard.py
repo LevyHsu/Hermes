@@ -64,7 +64,9 @@ class StatusDashboard:
             'queue_size': 0,
             'items_added': 0,
             'items_dropped': 0,
-            'total_news': 0  # New counter for total news processed
+            'total_news': 0,  # New counter for total news processed
+            'first_round_times': [],  # Track first round reasoning times
+            'second_round_times': []  # Track second round reasoning times
         }
         self.running = False
         self.thread = None
@@ -237,6 +239,27 @@ class StatusDashboard:
             stats_text.append(f"\nHigh Conf Rate: ", style="white")
             color = "green" if high_conf_pct > 30 else "yellow" if high_conf_pct > 15 else "red"
             stats_text.append(f"{high_conf_pct:.1f}%", style=f"bold {color}")
+        
+        # LLM Processing Times
+        stats_text.append(f"\n\nLLM Processing Times", style="bold cyan")
+        
+        # First round average
+        if self.stats['first_round_times']:
+            avg_first = sum(self.stats['first_round_times']) / len(self.stats['first_round_times'])
+            stats_text.append(f"\n1st Round Avg: ", style="white")
+            stats_text.append(f"{avg_first:.1f}s", style="bold yellow")
+        else:
+            stats_text.append(f"\n1st Round Avg: ", style="white")
+            stats_text.append(f"--", style="dim")
+        
+        # Second round average
+        if self.stats['second_round_times']:
+            avg_second = sum(self.stats['second_round_times']) / len(self.stats['second_round_times'])
+            stats_text.append(f"\n2nd Round Avg: ", style="white")
+            stats_text.append(f"{avg_second:.1f}s", style="bold yellow")
+        else:
+            stats_text.append(f"\n2nd Round Avg: ", style="white")
+            stats_text.append(f"--", style="dim")
         
         return Panel(
             stats_text,
@@ -415,10 +438,19 @@ class StatusDashboard:
         # Preserve and accumulate total_news counter
         if 'total_news' in stats:
             self.stats['total_news'] = stats['total_news']
+        
+        # Preserve timing arrays (don't overwrite them)
+        first_round_times = self.stats.get('first_round_times', [])
+        second_round_times = self.stats.get('second_round_times', [])
+        
         # Update other stats
         for key, value in stats.items():
-            if key != 'total_news':  # Don't overwrite total_news again
+            if key not in ['total_news', 'first_round_times', 'second_round_times']:
                 self.stats[key] = value
+        
+        # Restore timing arrays
+        self.stats['first_round_times'] = first_round_times
+        self.stats['second_round_times'] = second_round_times
     
     def set_processing(self, minute_key: Optional[str]):
         """Set current processing item."""

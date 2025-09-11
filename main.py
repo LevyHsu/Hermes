@@ -388,8 +388,17 @@ def process_single_news_item(item: Dict, llm_client, confidence_threshold: float
         if not listings:
             return None
             
-        # Stage 1: Initial analysis
+        # Stage 1: Initial analysis with timing
+        first_round_start = time.time()
         decisions = analyze_news_initial(llm_client, item, listings)
+        first_round_time = time.time() - first_round_start
+        
+        # Track first round time in dashboard
+        if DASHBOARD and first_round_time > 0:
+            DASHBOARD.stats['first_round_times'].append(first_round_time)
+            # Keep only last 100 measurements to avoid memory growth
+            if len(DASHBOARD.stats['first_round_times']) > 100:
+                DASHBOARD.stats['first_round_times'] = DASHBOARD.stats['first_round_times'][-100:]
         
         if decisions:
             # Filter by confidence threshold
@@ -408,7 +417,8 @@ def process_single_news_item(item: Dict, llm_client, confidence_threshold: float
                         google_news = fetch_google_news(company_name, ticker, days=7, max_items=10)
                         price_data = fetch_price_data(ticker)
                         
-                        # Refine the decision with additional context
+                        # Refine the decision with additional context (with timing)
+                        second_round_start = time.time()
                         refined = refine_decision(
                             llm_client, 
                             item, 
@@ -417,6 +427,14 @@ def process_single_news_item(item: Dict, llm_client, confidence_threshold: float
                             {"google": len(google_news)},
                             price_data
                         )
+                        second_round_time = time.time() - second_round_start
+                        
+                        # Track second round time in dashboard
+                        if DASHBOARD and second_round_time > 0:
+                            DASHBOARD.stats['second_round_times'].append(second_round_time)
+                            # Keep only last 100 measurements to avoid memory growth
+                            if len(DASHBOARD.stats['second_round_times']) > 100:
+                                DASHBOARD.stats['second_round_times'] = DASHBOARD.stats['second_round_times'][-100:]
                         
                         if refined:
                             enriched_decisions.append(refined)
