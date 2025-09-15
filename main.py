@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 # Local imports
-from args import get_args, DATA_DIR, NEWS_DIR, RESULT_DIR, LISTING_DIR, TRADE_LOG_DIR, LOGS_DIR
+from args import get_args, DATA_DIR, NEWS_DIR, RESULT_DIR, LISTING_DIR, TRADE_LOG_DIR, LOGS_DIR, MAX_QUEUE_SIZE
 from status_dashboard import StatusDashboard
 from fetch_us_listings import run as update_stock_listings
 from llm import LMStudioClient
@@ -649,8 +649,8 @@ def main():
         return 1
         
     # Create priority queue
-    logging.info("Creating priority queue (size=64)...")
-    NEWS_QUEUE = TimeOrderedNewsQueue(max_size=64)
+    logging.info(f"Creating priority queue (size={MAX_QUEUE_SIZE})...")
+    NEWS_QUEUE = TimeOrderedNewsQueue(max_size=MAX_QUEUE_SIZE)
     
     # Initialize dashboard if not in quiet mode
     if not args.quiet and sys.stdout.isatty():
@@ -698,7 +698,7 @@ def main():
             if time.time() - last_status >= 60:
                 stats = NEWS_QUEUE.get_stats()
                 logging.info(
-                    f"Queue: {stats['queue_size']}/64 items, "
+                    f"Queue: {stats['queue_size']}/{MAX_QUEUE_SIZE} items, "
                     f"Added: {stats['items_added']}, "
                     f"Processed: {stats['items_processed']}, "
                     f"Dropped: {stats['items_dropped']}"

@@ -53,7 +53,7 @@ class TimeOrderedNewsQueue:
     Maintains time-based ordering with newest items first.
     """
     
-    def __init__(self, max_size: int = 64):
+    def __init__(self, max_size: int = 16):
         self.max_size = max_size
         self._queue = []
         self._lock = threading.RLock()

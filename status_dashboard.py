@@ -92,10 +92,17 @@ class StatusDashboard:
         table.add_column("Value", style="bold")
         
         # Queue metrics
-        queue_pct = (self.stats['queue_size'] / 64) * 100 if self.stats['queue_size'] <= 64 else 100
+        # Import max queue size from config
+        try:
+            from args import MAX_QUEUE_SIZE
+            max_size = MAX_QUEUE_SIZE
+        except ImportError:
+            max_size = 16  # Fallback default
+            
+        queue_pct = (self.stats['queue_size'] / max_size) * 100 if self.stats['queue_size'] <= max_size else 100
         queue_color = "green" if queue_pct < 50 else "yellow" if queue_pct < 80 else "red"
         
-        table.add_row("Queue Size:", f"[{queue_color}]{self.stats['queue_size']}/64 ({queue_pct:.0f}%)[/{queue_color}]")
+        table.add_row("Queue Size:", f"[{queue_color}]{self.stats['queue_size']}/{max_size} ({queue_pct:.0f}%)[/{queue_color}]")
         table.add_row("Items Added:", f"[green]{self.stats['items_added']}[/green]")
         table.add_row("Items Processed:", f"[blue]{self.stats['items_processed']}[/blue]")
         
@@ -501,7 +508,7 @@ class StatusDashboard:
 
 def create_simple_status_bar(queue_size: int, processing: str, high_conf: int) -> str:
     """Create a simple status bar string for logging."""
-    bar = f"[Queue: {queue_size}/64 | Processing: {processing} | High Conf: {high_conf}]"
+    bar = f"[Queue: {queue_size}/16 | Processing: {processing} | High Conf: {high_conf}]"
     return bar
 
 
@@ -519,7 +526,7 @@ if __name__ == "__main__":
             
             # Update queue stats
             dashboard.update_queue_stats({
-                'queue_size': random.randint(0, 64),
+                'queue_size': random.randint(0, 16),
                 'items_added': i * 2,
                 'items_processed': i,
                 'items_dropped': max(0, i - 50)

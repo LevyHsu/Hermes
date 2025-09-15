@@ -108,6 +108,9 @@ LLM_PROCESSING_TIMEOUT_MINUTES = 2  # Maximum time to process news before moving
 RETRY_FAILED_PROCESSING = False  # Whether to retry failed LLM processing
 MAX_RETRY_ATTEMPTS = 2  # Maximum retries for failed operations
 
+# Queue configuration
+MAX_QUEUE_SIZE = 16  # Maximum items in priority queue (reduced from 64 for faster processing)
+
 # System health monitoring
 HEALTH_CHECK_INTERVAL_MINUTES = 5  # Check system health every N minutes
 ALERT_ON_CONSECUTIVE_FAILURES = 3  # Alert if N consecutive failures occur
