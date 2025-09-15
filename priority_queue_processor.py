@@ -63,7 +63,8 @@ class TimeOrderedNewsQueue:
         # Statistics
         self.stats = {
             'items_added': 0,
-            'items_dropped': 0,
+            'items_dropped': 0,  # Dropped due to queue overflow
+            'items_stale': 0,    # Removed because too old (>3 minutes)
             'items_processed': 0,
             'items_skipped': 0
         }
@@ -178,7 +179,7 @@ class TimeOrderedNewsQueue:
             if not item.is_stale:
                 cleaned.append(item)
             else:
-                self.stats['items_dropped'] += 1
+                self.stats['items_stale'] += 1
                 logger.debug(f"Removed stale item {item.minute_key}")
                 
         if len(cleaned) < len(self._queue):

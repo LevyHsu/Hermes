@@ -64,6 +64,7 @@ class StatusDashboard:
             'queue_size': 0,
             'items_added': 0,
             'items_dropped': 0,
+            'items_stale': 0,  # Items removed because >3 minutes old
             'total_news': 0,  # New counter for total news processed
             'first_round_times': [],  # Track first round reasoning times
             'second_round_times': []  # Track second round reasoning times
@@ -97,7 +98,15 @@ class StatusDashboard:
         table.add_row("Queue Size:", f"[{queue_color}]{self.stats['queue_size']}/64 ({queue_pct:.0f}%)[/{queue_color}]")
         table.add_row("Items Added:", f"[green]{self.stats['items_added']}[/green]")
         table.add_row("Items Processed:", f"[blue]{self.stats['items_processed']}[/blue]")
-        table.add_row("Items Dropped:", f"[red]{self.stats['items_dropped']}[/red]" if self.stats['items_dropped'] > 0 else "0")
+        
+        # Show stale items separately from dropped
+        items_stale = self.stats.get('items_stale', 0)
+        if items_stale > 0:
+            table.add_row("Items Stale (>3min):", f"[yellow]{items_stale}[/yellow]")
+        
+        # Only show dropped if there actually are any (queue overflow)
+        if self.stats.get('items_dropped', 0) > 0:
+            table.add_row("Items Dropped (overflow):", f"[red]{self.stats['items_dropped']}[/red]")
         
         if self.current_processing:
             table.add_row("", "")  # Spacer
