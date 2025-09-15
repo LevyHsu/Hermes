@@ -4,7 +4,7 @@ Priority Queue Based News Processor
 
 Time-ordered priority queue for news processing where:
 - Latest news always gets highest priority
-- Queue has configurable max size (default 64)
+- Queue has configurable max size (default from config)
 - LLM always processes from the front (latest news)
 - Old news automatically gets dropped when queue is full
 """
@@ -17,6 +17,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
+
+# Import configuration
+try:
+    from args import MAX_QUEUE_SIZE
+    DEFAULT_QUEUE_SIZE = MAX_QUEUE_SIZE
+except ImportError:
+    DEFAULT_QUEUE_SIZE = 16
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +60,7 @@ class TimeOrderedNewsQueue:
     Maintains time-based ordering with newest items first.
     """
     
-    def __init__(self, max_size: int = 16):
+    def __init__(self, max_size: int = DEFAULT_QUEUE_SIZE):
         self.max_size = max_size
         self._queue = []
         self._lock = threading.RLock()
