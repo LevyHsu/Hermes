@@ -541,11 +541,11 @@ def print_summary(verifications: List[Verification]):
     else:
         print(f"  • Net P&L: -${abs(net_pnl):,.2f} ❌")
     
-    # Max gain/loss details
+    # Best/worst individual trades
     if max_gain > 0:
-        print(f"  • Max Gain: ${max_gain:,.2f} ({max_gain_ticker})")
+        print(f"  • Best Trade: ${max_gain:,.2f} ({max_gain_ticker})")
     if max_loss > 0:
-        print(f"  • Max Loss: ${max_loss:,.2f} ({max_loss_ticker})")
+        print(f"  • Worst Trade: ${max_loss:,.2f} ({max_loss_ticker})")
     
     # Detailed results by ticker
     for ticker in sorted(by_ticker.keys()):
